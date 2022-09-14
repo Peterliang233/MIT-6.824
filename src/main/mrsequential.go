@@ -3,7 +3,10 @@ package main
 //
 // simple sequential MapReduce.
 //
-// go run mrsequential.go wc.so pg*.txt
+// .so文件是一个动态库，通过go build -buildmode=plugin xxx.go命令生成的
+// mr-out-x为指定保存结果的文件的名字
+// pg*.txt为需要读取加载数据的文件的名字
+// go run mrsequential.go wc.so mr-out-xx pg*.txt
 //
 
 import "fmt"
@@ -23,7 +26,7 @@ func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 func main() {
-	if len(os.Args) < 3 {
+	if len(os.Args) < 4 {
 		fmt.Fprintf(os.Stderr, "Usage: mrsequential xxx.so inputfiles...\n")
 		os.Exit(1)
 	}
@@ -36,7 +39,7 @@ func main() {
 	// accumulate the intermediate Map output.
 	//
 	intermediate := []mr.KeyValue{}
-	for _, filename := range os.Args[2:] {
+	for _, filename := range os.Args[3:] {
 		file, err := os.Open(filename)
 		if err != nil {
 			log.Fatalf("cannot open %v", filename)
@@ -56,9 +59,10 @@ func main() {
 	// rather than being partitioned into NxM buckets.
 	//
 
+	// 对key进行排序，每个key对应的val都是1,排序之后相同的key都是相邻的
 	sort.Sort(ByKey(intermediate))
 
-	oname := "mr-out-0"
+	oname := os.Args[2]
 	ofile, _ := os.Create(oname)
 
 	//
@@ -68,6 +72,7 @@ func main() {
 	i := 0
 	for i < len(intermediate) {
 		j := i + 1
+		// 找到相同的key的最右边的下标
 		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
 			j++
 		}
