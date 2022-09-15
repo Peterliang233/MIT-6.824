@@ -1,10 +1,12 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"os"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -35,7 +37,31 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
+	for {
+		// 向coordinator获取任务进行执行
+		getArgs := GetTaskArgs{}
+		getReply := GetTaskReply{}
+		call("Coordinator.GetTask", &getArgs, &getReply)
+		switch getReply.Task.TaskType {
+		case MapTask:
+			fmt.Println("Get Map Task")
+		case ReduceTask:
+			fmt.Println("Get Reduce Task")
+		case WaitTask:
+			fmt.Println("Get Wait Task")
+		case DoneTask:
+			fmt.Println("All Task Done")
+			return;
+		default:
+			os.Exit(1)
+		}
 
+		// 任务执行完了之后需要告诉coordinatior任务执行情况
+		setTaskArgs := SetTaskDoneArgs{}
+		setTaskArgs.Task = getReply.Task
+		setTaskReply := SetTaskDoneReply{}
+		call("Coordinator.SetTaskDone", &setTaskArgs,&setTaskReply)
+	}
 }
 
 //

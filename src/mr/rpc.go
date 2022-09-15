@@ -22,6 +22,22 @@ type ExampleReply struct {
 	Y int
 }
 
+type GetTaskArgs struct {
+
+}
+
+type GetTaskReply struct {
+	Task TaskInfo
+}
+
+type SetTaskDoneArgs struct {
+	Task TaskInfo
+}
+
+type SetTaskDoneReply struct {
+	Ok bool
+}
+
 // Add your RPC definitions here.
 
 
