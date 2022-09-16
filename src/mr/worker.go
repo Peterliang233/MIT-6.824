@@ -56,7 +56,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		call("Coordinator.GetTask", &getArgs, &getReply)
 		switch getReply.Task.TaskType {
 		case MapTask:
-			fmt.Println("Get Map Task")
+			fmt.Printf("Get Map Task: %v\n", getReply.Task)
 			doMapf(mapf, getReply.Task)
 		case ReduceTask:
 			fmt.Println("Get Reduce Task")

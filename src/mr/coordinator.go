@@ -25,7 +25,7 @@ const (
 // 任务主要分为两种任务，一种是Map任务，主要是将数据进行分桶处理，另一种是Reduce任务，是进行统一的求和计数的操作
 type TaskInfo struct {
 	FileName string  // 一个任务处理一个文件的数据
-	TaskType int // 任务的类型， 1-Map任务，2-Recude任务
+	TaskType int // 任务的类型， 1-Map任务，2-Recude任务 3-Wait任务 4-Done任务
 	TaskID int // 任务的ID，用来唯一表示一个任务
 	NReduce int // reduce任务的个数
 	NMap int // map任务的个数，有几个需要读入的文件就有几个map任务
@@ -47,6 +47,8 @@ type Coordinator struct {
 	ReduceTaskInProgress map[int]TaskInfo
 
 	NReduce int // reduce任务的个数
+	NMap int // map任务的个数
+	StartReduce bool // 是否开始执行reduce任务
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -91,15 +93,17 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	}
 
 	// 如果Map任务已经执行完成了，就生成一些Reduce任务
-	if c.ReduceTaskReady == nil {
-		c.ReduceTaskReady = make(map[int]TaskInfo)
+	if !c.StartReduce {
 		for i := 0; i < c.NReduce; i ++ {
 			c.ReduceTaskReady[i] = TaskInfo{
 				TaskType: ReduceTask,
 				TaskID: i,
 				TimeStamp: time.Now().Unix(),
+				NReduce: c.NReduce,
+				NMap: c.NMap,
 			}
 		}
+		c.StartReduce = true
 	}
 
 	// 接下来才是返回Reduce的任务
@@ -188,6 +192,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	taskMapReady := make(map[int]TaskInfo)
 	taskMapInProgress := make(map[int]TaskInfo)
 	taskReduceInProgress := make(map[int]TaskInfo)
+	taskReduceReady := make(map[int]TaskInfo)
 
 	// 先初始化Map任务
 	numFile := len(files)
@@ -206,7 +211,12 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		MapTaskReady: taskMapReady,
 		MapTaskInProgress: taskMapInProgress,
 		ReduceTaskInProgress: taskReduceInProgress,
+		ReduceTaskReady: taskReduceReady,
+		NReduce: nReduce,
+		NMap: numFile,
+		StartReduce: false,
 	}
+
 
 	// Your code here.
 
