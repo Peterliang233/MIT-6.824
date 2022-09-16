@@ -1,11 +1,15 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io/ioutil"
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
+	"time"
 )
 
 //
@@ -15,6 +19,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -45,10 +57,13 @@ func Worker(mapf func(string, string) []KeyValue,
 		switch getReply.Task.TaskType {
 		case MapTask:
 			fmt.Println("Get Map Task")
+			doMapf(mapf, getReply.Task)
 		case ReduceTask:
 			fmt.Println("Get Reduce Task")
+			doReducef(reducef, getReply.Task)
 		case WaitTask:
 			fmt.Println("Get Wait Task")
+			time.Sleep(time.Second)
 		case DoneTask:
 			fmt.Println("All Task Done")
 			return;
@@ -62,6 +77,110 @@ func Worker(mapf func(string, string) []KeyValue,
 		setTaskReply := SetTaskDoneReply{}
 		call("Coordinator.SetTaskDone", &setTaskArgs,&setTaskReply)
 	}
+}
+
+// map任务处理详情
+// 将这个map任务进行处理，得到的key-val对划分到nReduce个桶里面
+func doMapf(mapf func(string,string) []KeyValue, mapTask TaskInfo) {
+	intermediateMaps := make([][]KeyValue,mapTask.NReduce)
+	for i, _ := range intermediateMaps {
+		intermediateMaps[i] = make([]KeyValue,0)
+	}
+
+	file, err := os.Open(mapTask.FileName)
+	if err != nil {
+		log.Fatalf("cannot open %v", mapTask.FileName)
+	}
+
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", mapTask.FileName)
+	}
+
+	file.Close()
+
+	kva := mapf(mapTask.FileName, string(content))
+
+
+	// 将得到的kv键值对通过哈希分桶到不同的桶里面
+	for _, kv := range kva {
+		idx := ihash(kv.Key)%mapTask.NReduce
+		intermediateMaps[idx] = append(intermediateMaps[idx], kv)
+	}
+
+	// 写入临时文件里面
+	for i := 0; i < mapTask.NReduce; i++ {
+		if len(intermediateMaps[i]) == 0 {
+			continue
+		}
+
+		oname := fmt.Sprintf("mr-%d-%d", mapTask.TaskID, i)
+		
+		// 先写入临时文件，然后
+		ofile, _ := ioutil.TempFile("./", "tmp_")
+		enc := json.NewEncoder(ofile)
+		for _, kv := range intermediateMaps[i] {
+			err := enc.Encode(&kv)
+			if err != nil {
+				log.Fatalf("write file error %v", err)
+			}
+		}
+		ofile.Close()
+		os.Rename(ofile.Name(), oname)
+	}
+
+}
+
+
+// reduce任务处理详情
+// 处理Map任务写入的那些临时文件的数据，将这些数据进行处理之后写入到最终的结果的文件里面
+func doReducef(reducef func(string,[]string) string, reduceTask TaskInfo) {
+	fmt.Printf("Reduce Work get task %d\n", reduceTask.TaskID)
+	
+	intermediate := make([]KeyValue, 0)
+
+	for i := 0; i < reduceTask.NMap; i ++ {
+		iname := fmt.Sprintf("mr-%d-%d", i, reduceTask.TaskID)
+		file, err := os.Open(iname)
+		if err != nil {
+			log.Fatalf("Open file err: %v", err)
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate =append(intermediate, kv)
+		}
+		file.Close()
+	}
+
+
+	sort.Sort(ByKey(intermediate))
+
+	oname := fmt.Sprintf("mr-out-%d", reduceTask.TaskID)
+	ofile, _ := ioutil.TempFile("./", "tmp_")
+	for i := 0; i < len(intermediate); {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[j-1].Key {
+			j++
+		}
+
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+
+		output := reducef(intermediate[i].Key, values)
+
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		i=j
+	}
+
+	ofile.Close()
+	os.Rename(ofile.Name(), oname)
+	
 }
 
 //
