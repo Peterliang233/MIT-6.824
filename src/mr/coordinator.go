@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -9,7 +10,6 @@ import (
 	"os"
 	"sync"
 	"time"
-	"errors"
 )
 
 const (
@@ -48,6 +48,7 @@ type Coordinator struct {
 
 	NReduce int // reduce任务的个数
 	NMap int // map任务的个数
+	TmpDir string // 中间临时目录
 	StartReduce bool // 是否开始执行reduce任务
 }
 
@@ -63,9 +64,38 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
+
+// 回收超时的任务,超时时间设置为10s
+func (c *Coordinator) collectOutTimeTask() {
+	c.Mutex.Lock()
+	defer c.Mutex.Unlock()
+
+	curr := time.Now().Unix()
+
+	for i, task := range c.MapTaskInProgress {
+		if curr - task.TimeStamp > 10 {
+			c.MapTaskReady[i] = task
+			fmt.Printf("collect map task %v", task)
+			delete(c.MapTaskInProgress, i)
+		}
+	}
+
+
+	for i, task := range c.ReduceTaskInProgress {
+		if curr - task.TimeStamp > 10 {
+			c.ReduceTaskReady[i] = task
+			fmt.Printf("collect reduce task %v", task)
+
+			delete(c.ReduceTaskInProgress, i)
+		}
+	}
+}
+
 func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	c.Mutex.Lock()
 	defer c.Mutex.Unlock()
+
+	c.collectOutTimeTask()
 	// 先保证是Map任务都执行完成了
 	if len(c.MapTaskReady) > 0 {
 		for i,task := range c.MapTaskReady {
@@ -176,7 +206,7 @@ func (c *Coordinator) server() {
 func (c *Coordinator) Done() bool {
 	// Your code here.
 	if len(c.MapTaskInProgress) == 0 && len(c.MapTaskReady) == 0 &&
-		len(c.ReduceTaskInProgress) == 0 && len(c.ReduceTaskReady) == 0 {
+		len(c.ReduceTaskInProgress) == 0 && len(c.ReduceTaskReady) == 0 && c.StartReduce {
 			return true
 		}
 
@@ -189,15 +219,27 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	taskMapReady := make(map[int]TaskInfo)
-	taskMapInProgress := make(map[int]TaskInfo)
-	taskReduceInProgress := make(map[int]TaskInfo)
-	taskReduceReady := make(map[int]TaskInfo)
+
+	numFile := len(files)
+	c := Coordinator{
+		NReduce: nReduce,
+		NMap: numFile,
+		StartReduce: false,
+	}
+
+	// Your code here.
+	c.server()
+	c.Mutex.Lock()
+	defer c.Mutex.Unlock()
+
+	c.MapTaskReady = make(map[int]TaskInfo)
+	c.MapTaskInProgress = make(map[int]TaskInfo)
+	c.ReduceTaskReady = make(map[int]TaskInfo)
+	c.ReduceTaskInProgress = make(map[int]TaskInfo)
 
 	// 先初始化Map任务
-	numFile := len(files)
 	for i, file := range files {
-		taskMapReady[i] = TaskInfo{
+		c.MapTaskReady[i] = TaskInfo{
 			FileName: file,
 			TaskType: MapTask,
 			TaskID: i,
@@ -207,19 +249,5 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		}
 	}
 
-	c := Coordinator{
-		MapTaskReady: taskMapReady,
-		MapTaskInProgress: taskMapInProgress,
-		ReduceTaskInProgress: taskReduceInProgress,
-		ReduceTaskReady: taskReduceReady,
-		NReduce: nReduce,
-		NMap: numFile,
-		StartReduce: false,
-	}
-
-
-	// Your code here.
-
-	c.server()
 	return &c
 }
