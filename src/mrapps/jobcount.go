@@ -27,6 +27,7 @@ func Map(filename string, contents string) []mr.KeyValue {
 	if err != nil {
 		panic(err)
 	}
+	// 这里使Map任务休眠2～5s
 	time.Sleep(time.Duration(2000+rand.Intn(3000)) * time.Millisecond)
 	return []mr.KeyValue{mr.KeyValue{"a", "x"}}
 }

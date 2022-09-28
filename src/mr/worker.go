@@ -56,10 +56,10 @@ func Worker(mapf func(string, string) []KeyValue,
 		call("Coordinator.GetTask", &getArgs, &getReply)
 		switch getReply.Task.TaskType {
 		case MapTask:
-			fmt.Printf("Get Map Task: %v\n", getReply.Task)
+			fmt.Printf("Worker---------->Get Map Task: %v, %v\n",getReply.Task.TaskID, getReply.Task)
 			doMapf(mapf, getReply.Task)
 		case ReduceTask:
-			fmt.Println("Get Reduce Task")
+			fmt.Printf("Worker--------->Get Reduce Task: %v, %v\n",getReply.Task.TaskID, getReply.Task)
 			doReducef(reducef, getReply.Task)
 		case WaitTask:
 			fmt.Println("Get Wait Task")
@@ -82,6 +82,7 @@ func Worker(mapf func(string, string) []KeyValue,
 // map任务处理详情
 // 将这个map任务进行处理，得到的key-val对划分到nReduce个桶里面
 func doMapf(mapf func(string,string) []KeyValue, mapTask TaskInfo) {
+	fmt.Printf("Map worker get taskID:%v\n",mapTask.TaskID)
 	intermediateMaps := make([][]KeyValue,mapTask.NReduce)
 	for i, _ := range intermediateMaps {
 		intermediateMaps[i] = make([]KeyValue,0)

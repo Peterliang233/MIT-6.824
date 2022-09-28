@@ -67,13 +67,12 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 
 // 回收超时的任务,超时时间设置为10s
 func (c *Coordinator) collectOutTimeTask() {
-	c.Mutex.Lock()
-	defer c.Mutex.Unlock()
 
 	curr := time.Now().Unix()
 
 	for i, task := range c.MapTaskInProgress {
 		if curr - task.TimeStamp > 10 {
+			// 如果这个任务超时了，就需要将这个任务从正在执行的状态转换为待执行的状态
 			c.MapTaskReady[i] = task
 			fmt.Printf("collect map task %v", task)
 			delete(c.MapTaskInProgress, i)
@@ -107,7 +106,7 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 			// 在准备执行的队列里面删除这个任务
 			delete(c.MapTaskReady, i)
 
-			fmt.Printf("Get Map Task,TaskID:%v, TaskInfo:%v\n", task.TaskID, task)
+			fmt.Printf("Master----------->Get Map Task,TaskID:%v, TaskInfo:%v\n", task.TaskID, task)
 			return nil
 		}
 
@@ -118,12 +117,13 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	if len(c.MapTaskInProgress) > 0 {
 		reply.Task.TaskType = WaitTask
 		reply.Task.TimeStamp = time.Now().Unix()
-		fmt.Println("Get Map Task InProgress")
+		fmt.Printf("Get Map Task InProgress,these tasks is %v", c.MapTaskInProgress)
 		return nil
 	}
 
 	// 如果Map任务已经执行完成了，就生成一些Reduce任务
 	if !c.StartReduce {
+		fmt.Println("All Map Task Done,Start to execute Reduce Task!")
 		for i := 0; i < c.NReduce; i ++ {
 			c.ReduceTaskReady[i] = TaskInfo{
 				TaskType: ReduceTask,
@@ -143,8 +143,7 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 			reply.Task = task
 			c.ReduceTaskInProgress[i]=task
 			delete(c.ReduceTaskReady, i)
-
-			fmt.Printf("Get Reduce Task, %v\n", task)
+			fmt.Printf("Master------->Reduce Task,taskID:%v, taskInfo:%v\n",task.TaskID, task)
 			return nil
 		}
 		return errors.New("Get Reduce Task error")
@@ -154,6 +153,7 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	if len(c.ReduceTaskInProgress) > 0 {
 		reply.Task.TaskType = WaitTask
 		reply.Task.TimeStamp = time.Now().Unix()
+		fmt.Printf("Get Reduce Task InProgress,these tasks is %v", c.ReduceTaskInProgress)
 		return nil
 	}
 
@@ -204,6 +204,8 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 // 所有的任务执行完之后需要执行的操作
 func (c *Coordinator) Done() bool {
+	c.Mutex.Lock()
+	defer c.Mutex.Unlock()
 	// Your code here.
 	if len(c.MapTaskInProgress) == 0 && len(c.MapTaskReady) == 0 &&
 		len(c.ReduceTaskInProgress) == 0 && len(c.ReduceTaskReady) == 0 && c.StartReduce {
