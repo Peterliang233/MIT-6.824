@@ -111,9 +111,9 @@ func doMapf(mapf func(string,string) []KeyValue, mapTask TaskInfo) {
 
 	// 写入临时文件里面
 	for i := 0; i < mapTask.NReduce; i++ {
-		if len(intermediateMaps[i]) == 0 {
-			continue
-		}
+		// if len(intermediateMaps[i]) == 0 {
+		// 	continue
+		// }
 
 		oname := fmt.Sprintf("mr-%d-%d", mapTask.TaskID, i)
 		

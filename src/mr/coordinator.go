@@ -74,7 +74,7 @@ func (c *Coordinator) collectOutTimeTask() {
 		if curr - task.TimeStamp > 10 {
 			// 如果这个任务超时了，就需要将这个任务从正在执行的状态转换为待执行的状态
 			c.MapTaskReady[i] = task
-			fmt.Printf("collect map task %v", task)
+			fmt.Printf("collect map task %v\n", task)
 			delete(c.MapTaskInProgress, i)
 		}
 	}
@@ -83,7 +83,7 @@ func (c *Coordinator) collectOutTimeTask() {
 	for i, task := range c.ReduceTaskInProgress {
 		if curr - task.TimeStamp > 10 {
 			c.ReduceTaskReady[i] = task
-			fmt.Printf("collect reduce task %v", task)
+			fmt.Printf("collect reduce task %v\n", task)
 
 			delete(c.ReduceTaskInProgress, i)
 		}
@@ -117,7 +117,7 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	if len(c.MapTaskInProgress) > 0 {
 		reply.Task.TaskType = WaitTask
 		reply.Task.TimeStamp = time.Now().Unix()
-		fmt.Printf("Get Map Task InProgress,these tasks is %v", c.MapTaskInProgress)
+		fmt.Printf("Get Map Task InProgress,these tasks is %v\n", c.MapTaskInProgress)
 		return nil
 	}
 
@@ -153,7 +153,7 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	if len(c.ReduceTaskInProgress) > 0 {
 		reply.Task.TaskType = WaitTask
 		reply.Task.TimeStamp = time.Now().Unix()
-		fmt.Printf("Get Reduce Task InProgress,these tasks is %v", c.ReduceTaskInProgress)
+		fmt.Printf("Get Reduce Task InProgress,these tasks is %v\n", c.ReduceTaskInProgress)
 		return nil
 	}
 
