@@ -8,20 +8,24 @@ package raft
 // test with the original before submitting.
 //
 
-import "6.824/labgob"
-import "6.824/labrpc"
-import "bytes"
-import "log"
-import "sync"
-import "sync/atomic"
-import "testing"
-import "runtime"
-import "math/rand"
-import crand "crypto/rand"
-import "math/big"
-import "encoding/base64"
-import "time"
-import "fmt"
+import (
+	"bytes"
+	"log"
+	"math/rand"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"6.824/labgob"
+	"6.824/labrpc"
+
+	crand "crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"math/big"
+	"time"
+)
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
@@ -91,7 +95,9 @@ func make_config(t *testing.T, n int, unreliable bool, snapshot bool) *config {
 	if snapshot {
 		applier = cfg.applierSnap
 	}
+
 	// create a full set of Rafts.
+	// start n server node
 	for i := 0; i < cfg.n; i++ {
 		cfg.logs[i] = map[int]interface{}{}
 		cfg.start1(i, applier)
@@ -275,6 +281,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 // this server. since we cannot really kill it.
 //
 func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
+	// 先关闭这个服务节点的连接
 	cfg.crash1(i)
 
 	// a fresh set of outgoing ClientEnd names.
@@ -431,6 +438,7 @@ func (cfg *config) setlongreordering(longrel bool) {
 //
 func (cfg *config) checkOneLeader() int {
 	for iters := 0; iters < 10; iters++ {
+		// 设置一个时钟周期，时钟一到就可以这个节点就可以申请成为leader
 		ms := 450 + (rand.Int63() % 100)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
@@ -445,9 +453,11 @@ func (cfg *config) checkOneLeader() int {
 
 		lastTermWithLeader := -1
 		for term, leaders := range leaders {
+			// 需要保证leader的个数只有一个
 			if len(leaders) > 1 {
 				cfg.t.Fatalf("term %d has %d (>1) leaders", term, len(leaders))
 			}
+			// 找到有最新的term的leader
 			if term > lastTermWithLeader {
 				lastTermWithLeader = term
 			}
@@ -462,6 +472,7 @@ func (cfg *config) checkOneLeader() int {
 }
 
 // check that everyone agrees on the term.
+// 检查各个节点的任期，需要保证所有的有效节点的任期是一致的
 func (cfg *config) checkTerms() int {
 	term := -1
 	for i := 0; i < cfg.n; i++ {

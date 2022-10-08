@@ -19,13 +19,14 @@ package raft
 
 import (
 	//	"bytes"
+	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
 )
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -50,6 +51,12 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+const (
+	Follow = 1
+	Candidate = 2
+	Leader = 3
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -63,16 +70,30 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	currentTerm int  // 当前的term
+	votedFor int // candidateId that received vote in current term(or null id none)
+	getVoteNum int // total vote after requestvote
+	log []byte // log entries
+	leaderId int // leader's id
+	state int // role of this server
+	electionTimer time.Time // start a new selection
+	heartsbeatsTicker time.Time
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	if rf.state == Leader && rf.leaderId == rf.me {
+		isleader = true
+	}else{
+		isleader = false
+	}
 	return term, isleader
 }
 
@@ -143,6 +164,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term int
+	CandidateId int
+	LastLogIndex int
+	LastLogTerm int
 }
 
 //
@@ -151,13 +176,25 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term int // 当前这个节点的任期Id
+	VoteGranted int  // 将这个票投给了那个server节点
+	Succ bool
 }
 
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// Your code here (2A, 2B).
+	if rf.currentTerm > args.Term {
+		reply.Succ = false
+		log.Fatalf("任期ID小于当前server: %v节点的任期ID", rf.me)
+		return
+	}
+	
+	
 }
 
 //
