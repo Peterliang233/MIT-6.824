@@ -438,19 +438,22 @@ func (cfg *config) setlongreordering(longrel bool) {
 //
 func (cfg *config) checkOneLeader() int {
 	for iters := 0; iters < 10; iters++ {
-		// 设置一个时钟周期，时钟一到就可以这个节点就可以申请成为leader
 		ms := 450 + (rand.Int63() % 100)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
 		leaders := make(map[int][]int)
 		for i := 0; i < cfg.n; i++ {
 			if cfg.connected[i] {
+				fmt.Printf("raftId: %v, raftState:%v, raftLeaderId:%v\n", cfg.rafts[i].me, cfg.rafts[i].state, cfg.rafts[i].leaderId)
 				if term, leader := cfg.rafts[i].GetState(); leader {
+					fmt.Printf("Term: %v\n", term)
 					leaders[term] = append(leaders[term], i)
 				}
 			}
 		}
 
+
+		fmt.Println(leaders)
 		lastTermWithLeader := -1
 		for term, leaders := range leaders {
 			// 需要保证leader的个数只有一个
