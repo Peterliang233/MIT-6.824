@@ -444,16 +444,15 @@ func (cfg *config) checkOneLeader() int {
 		leaders := make(map[int][]int)
 		for i := 0; i < cfg.n; i++ {
 			if cfg.connected[i] {
-				fmt.Printf("raftId: %v, raftState:%v, raftLeaderId:%v\n", cfg.rafts[i].me, cfg.rafts[i].state, cfg.rafts[i].leaderId)
+				DPrintf("[checkOneLeader] raftId: %v, raftState:%v\n", cfg.rafts[i].me, cfg.rafts[i].state)
 				if term, leader := cfg.rafts[i].GetState(); leader {
-					fmt.Printf("Term: %v\n", term)
 					leaders[term] = append(leaders[term], i)
 				}
 			}
 		}
 
 
-		fmt.Println(leaders)
+		DPrintf("[checkOneLeader] now leaders: %v\n", leaders)
 		lastTermWithLeader := -1
 		for term, leaders := range leaders {
 			// 需要保证leader的个数只有一个
