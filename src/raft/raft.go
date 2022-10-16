@@ -90,9 +90,8 @@ type Raft struct {
 }
 
 
-// 重置选举超时时间，150ms～300ms
+// timeout start to election
 func (rf *Raft) timerElection() {
-
 	for {
 		rf.mu.Lock()
 
@@ -100,7 +99,7 @@ func (rf *Raft) timerElection() {
 			timeElapsed := (time.Now().UnixNano() - rf.lastResetElectionTimer) / time.Hour.Milliseconds()
 			if timeElapsed > rf.timeoutElection {
 				// 超时执行选举
-				DPrintf("server %v timeout, start to elect, state: %v, currentTerm: %v\n", rf.me, rf.state, rf.currentTerm)
+				DPrintf("[timerElection] server %v timeout, start to elect, state: %v, currentTerm: %v\n", rf.me, rf.state, rf.currentTerm)
 				rf.timerElectionChan <- true
 			}
 		}
@@ -317,57 +316,6 @@ type RequestVoteReply struct {
 }
 
 //
-// example RequestVote RPC handler.
-//
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if args.Term > rf.currentTerm {
-		// 如果请求的term大于自身的term,说明自身慢于发起请求的这个节点，需要改变为follow节点
-		rf.convertTo(Follow)
-		rf.currentTerm = args.Term
-	}
-	// Your code here (2A, 2B).
-	if rf.currentTerm > args.Term || (rf.voteFor != -1 && rf.voteFor != args.CandidateId) {
-		DPrintf("[RequestVote] raft %v reject vote for %v, state: %v, currentTerm: %v, args.Term:%v\n", rf.me, args.CandidateId,
-		rf.state, rf.currentTerm, args.Term)
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-		return
-	}
-
-
-
-	// 这个地方需要保证发起请求的term大于自己的term，或者在term相等的情况下，日志的最大索引大于自身的日志的最大索引。
-	// 这里需要注意在同一个term下面可能出现多条日志。
-	if (rf.voteFor == -1 || rf.voteFor == args.CandidateId) {
-		reply.VoteGranted = true
-		reply.Term = args.Term
-		rf.voteFor = args.CandidateId
-		rf.persist()
-		rf.resetTimerElection()
-		// 给自己的channel发送一个信息提示投票了
-		DPrintf("[RequestVote] server %v success vote for %v\n", rf.me, args.CandidateId)
-	}
-}
-
-func (rf *Raft) convertTo(state int){
-	switch state {
-	case Follow:
-		rf.voteFor = -1
-		rf.state = Follow
-	case Candidate:
-		rf.state = Candidate
-		rf.currentTerm ++ 
-		rf.voteFor = rf.me
-		rf.resetTimerElection()
-	case Leader:
-		rf.state = Leader
-		rf.resetTimerHeartbeat()
-	}
-}
-
-//
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -420,13 +368,63 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		onceLeader.Do(func() {
 			rf.convertTo(Leader)
 			DPrintf("[sendRequestVote] server %v become leader\n", rf.me)
-			rf.mu.Lock()
 			rf.broadcastHeartbeat()
-			rf.mu.Unlock()
 		})
 	}
 
 }
+
+//
+// example RequestVote RPC handler.
+//
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term > rf.currentTerm {
+		// 如果请求的term大于自身的term,说明自身慢于发起请求的这个节点，需要改变为follow节点
+		rf.convertTo(Follow)
+		rf.currentTerm = args.Term
+	}
+	// Your code here (2A, 2B).
+	if rf.currentTerm > args.Term || (rf.voteFor != -1 && rf.voteFor != args.CandidateId) {
+		DPrintf("[RequestVote] raft %v reject vote for %v, state: %v, currentTerm: %v, args.Term:%v\n", rf.me, args.CandidateId,
+		rf.state, rf.currentTerm, args.Term)
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
+
+
+	// 这个地方需要保证发起请求的term大于自己的term，或者在term相等的情况下，日志的最大索引大于自身的日志的最大索引。
+	// 这里需要注意在同一个term下面可能出现多条日志。
+	if (rf.voteFor == -1 || rf.voteFor == args.CandidateId) {
+		reply.VoteGranted = true
+		reply.Term = rf.currentTerm
+		rf.voteFor = args.CandidateId
+		rf.persist()
+		rf.resetTimerElection()
+		// 给自己的channel发送一个信息提示投票了
+		DPrintf("[RequestVote] server %v success vote for %v\n", rf.me, args.CandidateId)
+	}
+}
+
+func (rf *Raft) convertTo(state int){
+	switch state {
+	case Follow:
+		rf.voteFor = -1
+		rf.state = Follow
+	case Candidate:
+		rf.state = Candidate
+		rf.currentTerm ++ 
+		rf.voteFor = rf.me
+		rf.resetTimerElection()
+	case Leader:
+		rf.state = Leader
+		rf.resetTimerHeartbeat()
+	}
+}
+
 
 
 //
@@ -456,6 +454,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 
 func (rf *Raft) broadcastHeartbeat() {
+	DPrintf("server %v start to broadcastHeartbeat\n", rf.me)
 	rf.mu.Lock()
 	state := rf.state
 	if state != Leader {
@@ -463,7 +462,7 @@ func (rf *Raft) broadcastHeartbeat() {
 		return
 	}
 
-	rf.resetTimerElection()
+	rf.resetTimerHeartbeat()
 	rf.mu.Unlock()
 
 	args := &AppendEntriesArgs{
@@ -608,6 +607,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = Follow
 	rf.currentTerm = 0
 	rf.voteFor = -1
+	rf.timeoutHeartbeat = 100
 	rf.resetTimerElection()
 	rf.resetChannel()
 	// initialize from state persisted before a crash
