@@ -87,6 +87,15 @@ type Raft struct {
 	lastResetHeartbeatTimer int64
 	timeoutHeartbeat int64
 	timeoutElection int64
+
+
+	nextIndex []int
+	matchIndex []int
+	log []LogEntry
+	commitIndex int
+	lastApplied int
+
+	applyCh chan ApplyMsg
 }
 
 
@@ -218,6 +227,25 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
+func (rf *Raft) applyEntries() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for i := rf.lastApplied + 1; i < rf.commitIndex; i ++ {
+		applyMsg := ApplyMsg{
+			CommandValid: true,
+			Command: rf.log[i].Command,
+			CommandIndex: i,
+		}
+
+		rf.applyCh <- applyMsg
+
+		rf.lastApplied += 1
+
+		DPrintf("[applyEntries] raft %v applied entry, lastApplied: %v, commitIndex: %v\n", rf.me, rf.lastApplied, rf.commitIndex)
+	}
+}
+
 type AppendEntriesArgs struct {
 	Term int
 	LeaderId int
@@ -245,6 +273,40 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	// 如果没有最新的这个索引或者是最新的索引的Term对应不上
+	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		DPrintf("[AppendEntries] server %v reject %v append, len(rf.log): %v, args.PrevLogIndex: %v, args.PrevLogTerm: %v\n",
+		rf.me, args.LeaderId, len(rf.log), args.PrevLogIndex, args.PrevLogTerm)
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	// 找到最开始矛盾的点的位置
+	isMatch := true
+	nextIndex := args.PrevLogIndex + 1
+	conflictIndex := 0
+	logLen := len(rf.log)
+	entryLen := len(args.Entries)
+	for i := 0; isMatch && i < entryLen; i ++ {
+		if ((logLen - 1) < (nextIndex + i)) || rf.log[nextIndex+i].Term != args.Entries[i].Term {
+			isMatch = false
+			conflictIndex = i
+			break
+		}
+	}
+	if !isMatch {
+		rf.log = append(rf.log[:nextIndex + conflictIndex], args.Entries[conflictIndex:]...)
+		DPrintf("[AppendEntries] raft %v append entries from leader\n", rf.me)
+	}
+
+
+
+	lastNewEntryIndex := args.PrevLogIndex + entryLen
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = Min(args.LeaderCommit, lastNewEntryIndex)
+		go rf.applyEntries()
+	}
 
 	rf.resetTimerElection()
 
@@ -280,6 +342,8 @@ func (rf *Raft) sendAppendEntries(serverId int,args *AppendEntriesArgs, reply *A
 
 	if reply.Success {
 		DPrintf("[appendEntriesAsync] success, server %v received %v entries\n", serverId, rf.me)
+		rf.matchIndex[serverId] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
 		return
 	}else{
 		DPrintf("[appendEntriesAsync] fail, state: %v, term: %v\n", rf.state, rf.currentTerm)
@@ -395,6 +459,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 
+	lastLogIndex := len(rf.log) - 1
+	isLatest := rf.log[lastLogIndex].Term > args.LastLogTerm || 
+		(rf.log[lastLogIndex].Term == args.LastLogTerm && len(rf.log) - 1 > lastLogIndex)
+
+	// 如果自身的状态更新，那么就取消	
+	if isLatest {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
 
 	// 这个地方需要保证发起请求的term大于自己的term，或者在term相等的情况下，日志的最大索引大于自身的日志的最大索引。
 	// 这里需要注意在同一个term下面可能出现多条日志。
@@ -447,7 +522,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
+	if term, isLeader = rf.GetState(); isLeader {
+		rf.mu.Lock()
+		rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
+		index = len(rf.log) - 1
+		DPrintf("[Start] raft %v replicate log,state: %v,currentTerm:%v,index:%v\n", rf.me,rf.state, rf.currentTerm, index)
+		rf.mu.Unlock()
+	}
 
 	return index, term, isLeader
 }
@@ -470,11 +551,11 @@ func (rf *Raft) broadcastHeartbeat() {
 		LeaderId: rf.me,
 	}
 
-	reply := &AppendEntriesReply{}
 
 	// 给其他每个节点发送一个心跳,证明Leader自己是还存活的
 	for i := range rf.peers {
 		if i != rf.me {
+			reply := &AppendEntriesReply{}
 			go rf.sendAppendEntries(i, args,reply)
 		}
 	}
@@ -492,59 +573,34 @@ func (rf *Raft) startElection() {
 	rf.persist()
 
 	rf.getVoteNum = 1
+	for i := 0;i < len(rf.peers); i ++ {
+		rf.nextIndex[i] = len(rf.log)
+		rf.matchIndex[i] = 0
+	}
 
 	DPrintf("[startElection] raft server %v start election,state: %v, currentTerm:%v\n", rf.me, rf.state, rf.currentTerm)
 
 	args := &RequestVoteArgs{
 		Term: rf.currentTerm,
 		CandidateId: rf.me,
+		LastLogIndex: len(rf.log)-1,
+		LastLogTerm: rf.log[len(rf.log)-1].Term,
 	}
 
 	rf.mu.Unlock()
 
-	reply := &RequestVoteReply{}
 
 	var onceLeader sync.Once
 
 	for i := range rf.peers {
 		if i != rf.me {
+			reply := &RequestVoteReply{}
 			go rf.sendRequestVote(i, args, reply, onceLeader)
 		}
 	}
 	
 }
 
-func (rf *Raft) broadcastRequestVote() {
-	if rf.state != Candidate {
-		return
-	}
-
-	args := &RequestVoteArgs{
-		Term: rf.currentTerm,
-		CandidateId: rf.me,
-	}
-
-	reply := &RequestVoteReply{}
-
-	var onceLeader sync.Once
-	
-	for i := range rf.peers {
-		if i != rf.me {
-			// 向其他节点发起投票请求
-			go rf.sendRequestVote(i, args, reply, onceLeader)
-		}
-	}
-}
-
-func (rf *Raft) broadcastAppendEntries() {
-	rf.mu.Lock()
-	state := rf.state
-	rf.mu.Unlock()
-	if state != Leader {
-		return
-	}
-
-}
 
 //
 // the tester doesn't halt goroutines created by Raft after each test,
