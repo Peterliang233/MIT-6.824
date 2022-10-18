@@ -266,6 +266,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
@@ -273,15 +274,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// 如果没有最新的这个索引或者是最新的索引的Term对应不上
-	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		DPrintf("[AppendEntries] server %v reject %v append, len(rf.log): %v, args.PrevLogIndex: %v, args.PrevLogTerm: %v\n",
+
+	// Reply false if log doesn't contain an entry at prevLogIndx whose term matches prevLogTerm
+	// 需要比较前一条日志的索引和term，需要保证有这个索引和term可以对应上，这样保证了所有的日志
+	if  args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		DPrintf("[AppendEntries] server %v reject %v append,prevLogIndex and prevLogTerm conflict, len(rf.log): %v, args.PrevLogIndex: %v, args.PrevLogTerm: %v\n",
 		rf.me, args.LeaderId, len(rf.log), args.PrevLogIndex, args.PrevLogTerm)
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
+
+	// If an existing entry conflict with a new one(same index but different terms), delete the existing entry and all that follow it
 	// 找到最开始矛盾的点的位置
 	isMatch := true
 	nextIndex := args.PrevLogIndex + 1
@@ -295,13 +300,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			break
 		}
 	}
+	// Append any new entries not already in the log.
 	if !isMatch {
+		// [0, nextIndex + conflictIndex) + [conflictIndex,len(entries)-1)
+		// 前面不矛盾的加上后面矛盾的就是当前的最新的日志
 		rf.log = append(rf.log[:nextIndex + conflictIndex], args.Entries[conflictIndex:]...)
 		DPrintf("[AppendEntries] raft %v append entries from leader\n", rf.me)
 	}
 
 
-
+	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	lastNewEntryIndex := args.PrevLogIndex + entryLen
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = Min(args.LeaderCommit, lastNewEntryIndex)
@@ -432,6 +440,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		onceLeader.Do(func() {
 			rf.convertTo(Leader)
 			DPrintf("[sendRequestVote] server %v become leader\n", rf.me)
+			for i := 0;i < len(rf.peers); i ++ {
+				rf.nextIndex[i] = len(rf.log)
+				rf.matchIndex[i] = 0
+			}
 			rf.broadcastHeartbeat()
 		})
 	}
@@ -460,10 +472,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 
 	lastLogIndex := len(rf.log) - 1
+	// 1、最新的term大于请求方的最新的term（小于的情况在这之前讨论过了）
+	// 2、在term相等的情况下，日志的最大索引大于请求方的最大的日志索引
+	// 3、以上，说明所有的情况都讨论完成了
 	isLatest := rf.log[lastLogIndex].Term > args.LastLogTerm || 
 		(rf.log[lastLogIndex].Term == args.LastLogTerm && len(rf.log) - 1 > lastLogIndex)
 
-	// 如果自身的状态更新，那么就取消	
+	// 如果自身的状态比请求的节点的日志更新，那么就拒绝投票
 	if isLatest {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -546,15 +561,18 @@ func (rf *Raft) broadcastHeartbeat() {
 	rf.resetTimerHeartbeat()
 	rf.mu.Unlock()
 
-	args := &AppendEntriesArgs{
-		Term: rf.currentTerm,
-		LeaderId: rf.me,
-	}
 
-
-	// 给其他每个节点发送一个心跳,证明Leader自己是还存活的
+	// 给其他每个节点发送一个心跳,证明Leader自己是还存活的,以及更新日志
 	for i := range rf.peers {
 		if i != rf.me {
+			args := &AppendEntriesArgs{
+				Term: rf.currentTerm,
+				LeaderId: rf.me,
+				PrevLogIndex: rf.nextIndex[i]-1,
+				PrevLogTerm: rf.log[rf.nextIndex[i]-1].Term,
+				Entries: rf.log[rf.nextIndex[i]:],
+				LeaderCommit: rf.commitIndex,
+			}
 			reply := &AppendEntriesReply{}
 			go rf.sendAppendEntries(i, args,reply)
 		}
@@ -565,6 +583,7 @@ func (rf *Raft) broadcastHeartbeat() {
 func (rf *Raft) resetChannel() {
 	rf.timerElectionChan = make(chan bool)
 	rf.timerHeartbeatChan = make(chan bool)
+	rf.applyCh = make(chan ApplyMsg)
 }
 
 func (rf *Raft) startElection() {
@@ -573,10 +592,6 @@ func (rf *Raft) startElection() {
 	rf.persist()
 
 	rf.getVoteNum = 1
-	for i := 0;i < len(rf.peers); i ++ {
-		rf.nextIndex[i] = len(rf.log)
-		rf.matchIndex[i] = 0
-	}
 
 	DPrintf("[startElection] raft server %v start election,state: %v, currentTerm:%v\n", rf.me, rf.state, rf.currentTerm)
 
@@ -666,12 +681,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.timeoutHeartbeat = 100
 	rf.resetTimerElection()
 	rf.resetChannel()
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.log = append(rf.log, LogEntry{Term: 0})
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	// 开始一个定时器开始进行选举
 	go rf.ticker()
+
+	// Start two goroutine listen election's time & heartbeat's time
 	go rf.timerElection()
 	go rf.timerHeartbeat()
 
