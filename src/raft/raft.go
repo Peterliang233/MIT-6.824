@@ -231,7 +231,7 @@ func (rf *Raft) applyEntries() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	for i := rf.lastApplied + 1; i < rf.commitIndex; i ++ {
+	for i := rf.lastApplied + 1; i <= rf.commitIndex; i ++ {
 		applyMsg := ApplyMsg{
 			CommandValid: true,
 			Command: rf.log[i].Command,
@@ -263,6 +263,9 @@ type AppendEntriesReply struct {
 
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	defer func(){
+		DPrintf("RPC AppendEntries, args: %v, reply: %v\n", args, reply)
+	}()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -305,12 +308,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// [0, nextIndex + conflictIndex) + [conflictIndex,len(entries)-1)
 		// 前面不矛盾的加上后面矛盾的就是当前的最新的日志
 		rf.log = append(rf.log[:nextIndex + conflictIndex], args.Entries[conflictIndex:]...)
-		DPrintf("[AppendEntries] raft %v append entries from leader\n", rf.me)
+		DPrintf("[AppendEntries] raft %v append entries from leader,received entries: %v\n", rf.me, args.Entries[conflictIndex])
 	}
 
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	lastNewEntryIndex := args.PrevLogIndex + entryLen
+
+	// 说明自己还有一些日志没有被commmit
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = Min(args.LeaderCommit, lastNewEntryIndex)
 		go rf.applyEntries()
@@ -349,9 +354,10 @@ func (rf *Raft) sendAppendEntries(serverId int,args *AppendEntriesArgs, reply *A
 
 
 	if reply.Success {
-		DPrintf("[appendEntriesAsync] success, server %v received %v entries\n", serverId, rf.me)
+		DPrintf("[appendEntriesAsync] success, server %v received %v raft's entries\n", serverId, rf.me)
 		rf.matchIndex[serverId] = args.PrevLogIndex + len(args.Entries)
 		rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
+		rf.checkN()
 		return
 	}else{
 		DPrintf("[appendEntriesAsync] fail, state: %v, term: %v\n", rf.state, rf.currentTerm)
@@ -499,6 +505,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
+
+
+// If there exists an N such that N > commitIndex, a majority of matchIndex[i] >= N, and log[N].Term == currentTerm,
+// set commitIndex = N.
+func (rf *Raft) checkN(){
+	for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
+		nRepliaction := 0
+		for i := 0; i < len(rf.peers); i++ {
+			if rf.matchIndex[i] >= N && rf.log[N].Term == rf.currentTerm {
+				nRepliaction += 1
+			}
+
+			if nRepliaction > len(rf.peers)/2 {
+				rf.commitIndex = N
+				DPrintf("[checkN] raft %v commitIndex: %v\n",rf.me, rf.commitIndex)
+				go rf.applyEntries()
+				break
+			}
+		}
+	}
+}
+
 func (rf *Raft) convertTo(state int){
 	switch state {
 	case Follow:
@@ -540,6 +568,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if term, isLeader = rf.GetState(); isLeader {
 		rf.mu.Lock()
 		rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
+		rf.matchIndex[rf.me] = len(rf.log) - 1
 		index = len(rf.log) - 1
 		DPrintf("[Start] raft %v replicate log,state: %v,currentTerm:%v,index:%v\n", rf.me,rf.state, rf.currentTerm, index)
 		rf.mu.Unlock()
@@ -573,6 +602,7 @@ func (rf *Raft) broadcastHeartbeat() {
 				Entries: rf.log[rf.nextIndex[i]:],
 				LeaderCommit: rf.commitIndex,
 			}
+			DPrintf("[broadcastHeartbeat] this entries: %v, logs: %v\n", args.Entries, rf.log)
 			reply := &AppendEntriesReply{}
 			go rf.sendAppendEntries(i, args,reply)
 		}
@@ -583,7 +613,6 @@ func (rf *Raft) broadcastHeartbeat() {
 func (rf *Raft) resetChannel() {
 	rf.timerElectionChan = make(chan bool)
 	rf.timerHeartbeatChan = make(chan bool)
-	rf.applyCh = make(chan ApplyMsg)
 }
 
 func (rf *Raft) startElection() {
@@ -686,6 +715,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = append(rf.log, LogEntry{Term: 0})
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	rf.applyCh = applyCh
 
 
 	// initialize from state persisted before a crash
