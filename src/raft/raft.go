@@ -361,11 +361,11 @@ func (rf *Raft) sendAppendEntries(serverId int,args *AppendEntriesArgs, reply *A
 		return
 	}else{
 		DPrintf("[appendEntriesAsync] fail, state: %v, term: %v\n", rf.state, rf.currentTerm)
-
 		if reply.Term > rf.currentTerm {
 			rf.convertTo(Follow)
 			rf.currentTerm = reply.Term
 		}
+		// 这个地方如果返回失败，那么就需要执行重试操作（这里是将自己的日志的索引逐渐递减)，使得日志可以保持一致。
 	}
 
 }
@@ -460,6 +460,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	defer func(){
+		DPrintf("RPC RequestVote, args: %v, reply: %v\n", args, reply)
+	}()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term > rf.currentTerm {
@@ -513,6 +516,7 @@ func (rf *Raft) checkN(){
 	for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
 		nRepliaction := 0
 		for i := 0; i < len(rf.peers); i++ {
+			// 如果大多数节点的matchIndex已经大于当前leader节点的commitIndex，那么就需要更新commitIndex.
 			if rf.matchIndex[i] >= N && rf.log[N].Term == rf.currentTerm {
 				nRepliaction += 1
 			}
