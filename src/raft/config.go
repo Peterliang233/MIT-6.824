@@ -388,7 +388,7 @@ func (cfg *config) connect(i int) {
 
 // detach server i from the net.
 func (cfg *config) disconnect(i int) {
-	DPrintf("disconnnect(%d)\n", i)
+	DPrintf("disConnect(%d)\n", i)
 
 	cfg.connected[i] = false
 
@@ -450,7 +450,6 @@ func (cfg *config) checkOneLeader() int {
 				}
 			}
 		}
-
 
 		DPrintf("[checkOneLeader] now leaders: %v\n", leaders)
 		lastTermWithLeader := -1
@@ -618,7 +617,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
-	if !cfg.checkFinished(){
+	if !cfg.checkFinished() {
 		cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 	}
 	return -1

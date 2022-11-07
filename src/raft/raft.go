@@ -251,8 +251,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -260,7 +261,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 
 	rf.resetTimerElection()
-	rf.persist()
 
 	DPrintf("[AppendEntries] raft %v received raft %v appendEntries\n", rf.me, args.LeaderId)
 	// Reply false if term < currentTerm
@@ -271,13 +271,39 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// Reply false if log doesn't contain an entry at prevLogIndx whose term matches prevLogTerm
-	// 需要比较前一条日志的索引和term，需要保证有这个索引和term可以对应上，这样保证了所有的日志
+	if args.Term > rf.currentTerm {
+		rf.convertTo(Follow)
+		rf.currentTerm = args.Term
+		rf.persist()
+		DPrintf("[AppendEntries] raft %v term is less than raft %v, args.Term: %v, rf.currentTerm: %v\n",
+			rf.me, args.LeaderId, args.Term, rf.currentTerm)
+	} else if rf.state == Candidate {
+		rf.state = Follow
+		DPrintf("[AppendEntries] raft %v convert from Candidate to Follow\n", rf.me)
+	}
+
+	// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
+	// 需要比较前一条日志的索引和term，需要保证有这个索引和term都可以对应上，这样保证了所有的日志都是同步了
 	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		DPrintf("[AppendEntries] server %v reject %v append,prevLogIndex and prevLogTerm conflict, len(rf.log): %v, args.PrevLogIndex: %v, args.PrevLogTerm: %v\n",
+		DPrintf("[AppendEntries] server %v reject %v append,prevLogIndex and prevLogTerm conflict,"+
+			" len(rf.log): %v, args.PrevLogIndex: %v, args.PrevLogTerm: %v\n",
 			rf.me, args.LeaderId, len(rf.log), args.PrevLogIndex, args.PrevLogTerm)
 		reply.Term = rf.currentTerm
 		reply.Success = false
+
+		// 以下操作是为了尽可能尽快找到矛盾点
+		if len(rf.log) <= args.PrevLogIndex {
+			reply.ConflictIndex = len(rf.log)
+		} else {
+			// 无需一步一步的递减索引，可以直接找到当前term的最开始的索引进行重试，虽然不一定是刚好的矛盾点，但是却可以大幅度缩短重试次数
+			for i := args.PrevLogIndex; i >= 0; i-- {
+				if rf.log[i].Term != rf.log[i-1].Term {
+					reply.ConflictIndex = i
+					break
+				}
+			}
+		}
+
 		return
 	}
 
@@ -320,40 +346,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 }
 
-func (rf *Raft) sendAppendEntries(serverId int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (rf *Raft) sendAppendEntries(serverId int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	DPrintf("[sendAppendEntries] raft %v send appendEntries to raft %v\n", rf.me, serverId)
-	if ok := rf.peers[serverId].Call("Raft.AppendEntries", args, reply); !ok {
-		DPrintf("[sendAppendEntries] raft %v call raft %v Raft.AppendEntries failed\n", rf.me, serverId)
-		return
-	}
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.state != Leader {
-		DPrintf("[sendAppendEntries] lost leadership: state:%v, term:%v\n", rf.state, rf.currentTerm)
-		return
-	}
-
-	if rf.currentTerm != args.Term {
-		DPrintf("[sendAppendEntries] raft %v node term inconsistency: currentTerm:%v, args.Term:%v, state: %v\n", rf.me, rf.currentTerm,
-			args.Term, rf.state)
-		return
-	}
-
-	if reply.Success {
-		DPrintf("[sendAppendEntries] success, server %v received %v entries\n", serverId, rf.me)
-		rf.matchIndex[serverId] = args.PrevLogIndex + len(args.Entries)
-		rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
-		rf.checkN()
-	} else {
-		DPrintf("[sendAppendEntries] fail, state: %v, term: %v\n", rf.state, rf.currentTerm)
-
-		if reply.Term > rf.currentTerm {
-			rf.convertTo(Follow)
-			rf.currentTerm = reply.Term
-		}
-	}
-
+	return rf.peers[serverId].Call("Raft.AppendEntries", args, reply)
 }
 
 // checkN check have a half of peers
@@ -578,18 +573,57 @@ func (rf *Raft) broadcastHeartbeat() {
 	// 给其他每个节点发送一个心跳,证明Leader自己是还存活的,以及更新日志
 	for i := range rf.peers {
 		if i != rf.me {
-			rf.mu.Lock()
-			args := &AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: rf.nextIndex[i] - 1,
-				PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
-				Entries:      rf.log[rf.nextIndex[i]:],
-				LeaderCommit: rf.commitIndex,
-			}
-			reply := &AppendEntriesReply{}
-			rf.mu.Unlock()
-			go rf.sendAppendEntries(i, args, reply)
+			go func(i int) {
+			retry:
+				rf.mu.Lock()
+				args := &AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderId:     rf.me,
+					PrevLogIndex: rf.nextIndex[i] - 1,
+					PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
+					Entries:      rf.log[rf.nextIndex[i]:],
+					LeaderCommit: rf.commitIndex,
+				}
+				reply := &AppendEntriesReply{}
+				rf.mu.Unlock()
+				if rf.sendAppendEntries(i, args, reply) {
+					rf.mu.Lock()
+					if rf.state != Leader {
+						DPrintf("[broadcastHeartbeat] lost leadership: state:%v, term:%v\n", rf.state, rf.currentTerm)
+						rf.mu.Unlock()
+						return
+					}
+					if rf.currentTerm != args.Term {
+						DPrintf("[broadcastHeartbeat] raft %v node term inconsistency: currentTerm:%v, args.Term:%v, state: %v\n", rf.me, rf.currentTerm,
+							args.Term, rf.state)
+						rf.mu.Unlock()
+						return
+					}
+					if reply.Success {
+						DPrintf("[broadcastHeartbeat] success, server %v received %v entries\n", i, rf.me)
+						rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
+						rf.nextIndex[i] = rf.matchIndex[i] + 1
+						rf.checkN()
+					} else {
+						DPrintf("[broadcastHeartbeat] fail, state: %v, term: %v\n", rf.state, rf.currentTerm)
+						if reply.Term > rf.currentTerm {
+							rf.convertTo(Follow)
+							rf.currentTerm = reply.Term
+							rf.persist()
+							rf.mu.Unlock()
+							return
+						}
+
+						rf.nextIndex[i] = reply.ConflictIndex
+						DPrintf("[broadcastHeartbeat] raft %v append entries to %v reject: decrement nextIndex and retry\n", rf.me, i)
+						rf.mu.Unlock()
+						goto retry
+					}
+					rf.mu.Unlock()
+				} else {
+					DPrintf("[broadcastHeartbeat] raft %v call raft %v Raft.AppendEntries failed\n", rf.me, i)
+				}
+			}(i)
 		}
 	}
 }
