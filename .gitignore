@@ -4,3 +4,4 @@ api.key
 *-handin.tar.gz
 *.so
 mr-out*
+.idea/
