@@ -19,12 +19,14 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -171,13 +173,13 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -188,18 +190,20 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var voteFor int
+	var logs []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&voteFor) != nil ||
+		d.Decode(&logs) != nil {
+		DPrintf("[readPersist] decode the raft %v persist data error\n", rf.me)
+	} else {
+		rf.currentTerm = currentTerm
+		rf.voteFor = voteFor
+		rf.log = logs
+	}
 }
 
 //
@@ -260,8 +264,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.resetTimerElection()
-
 	DPrintf("[AppendEntries] raft %v received raft %v appendEntries\n", rf.me, args.LeaderId)
 	// Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
@@ -270,6 +272,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf("[AppendEntries] server %v reject %v append\n", rf.me, args.LeaderId)
 		return
 	}
+
+	rf.resetTimerElection()
 
 	if args.Term > rf.currentTerm {
 		rf.convertTo(Follow)
@@ -326,6 +330,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// [0, nextIndex + conflictIndex) + [conflictIndex,len(entries)-1)
 		// 前面不矛盾的加上后面矛盾的就是当前的最新的日志
 		rf.log = append(rf.log[:nextIndex+conflictIndex], args.Entries[conflictIndex:]...)
+		rf.persist()
 		DPrintf("[AppendEntries] raft %v append entries from leader\n", rf.me)
 	}
 
@@ -339,6 +344,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm || rf.state != Follow {
 		rf.convertTo(Follow)
 		rf.currentTerm = args.Term
+		rf.persist()
 		DPrintf("[AppendEntries] server %v accept %v append\n", rf.me, args.LeaderId)
 	}
 
@@ -434,6 +440,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	if reply.Term > rf.currentTerm {
 		rf.convertTo(Follow)
 		rf.currentTerm = reply.Term
+		rf.persist()
 		return
 	}
 
@@ -471,6 +478,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 如果请求的term大于自身的term,说明自身慢于发起请求的这个节点，需要改变为follow节点
 		rf.convertTo(Follow)
 		rf.currentTerm = args.Term
+		rf.persist()
 	}
 	// Your code here (2A, 2B).
 	if rf.currentTerm > args.Term || (rf.voteFor != -1 && rf.voteFor != args.CandidateId) {
@@ -482,6 +490,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	lastLogIndex := len(rf.log) - 1
+	// 拒绝投票的情况如下
 	// 1、最新的term大于请求方的最新的term（小于的情况在这之前讨论过了）
 	// 2、在term相等的情况下，日志的最大索引大于请求方的最大的日志索引
 	// 3、以上，说明所有的情况都讨论完成了
@@ -513,10 +522,12 @@ func (rf *Raft) convertTo(state int) {
 	case Follow:
 		rf.voteFor = -1
 		rf.state = Follow
+		rf.persist()
 	case Candidate:
 		rf.state = Candidate
 		rf.currentTerm++
 		rf.voteFor = rf.me
+		rf.persist()
 		rf.resetTimerElection()
 	case Leader:
 		rf.state = Leader
@@ -637,7 +648,6 @@ func (rf *Raft) resetChannel() {
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	rf.convertTo(Candidate)
-	rf.persist()
 
 	rf.getVoteNum = 1
 
