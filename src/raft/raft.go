@@ -486,7 +486,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 2、在term相等的情况下，日志的最大索引大于请求方的最大的日志索引
 	// 3、以上，说明所有的情况都讨论完成了
 	isLatest := rf.log[lastLogIndex].Term > args.LastLogTerm ||
-		(len(rf.log)-1 > lastLogIndex && rf.log[lastLogIndex].Term == args.LastLogTerm)
+		(rf.log[lastLogIndex].Term == args.LastLogTerm && args.LastLogIndex < lastLogIndex)
 
 	// 如果自身的状态比请求的节点的日志更新，那么就拒绝投票
 	if isLatest {
@@ -636,7 +636,6 @@ func (rf *Raft) resetChannel() {
 
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
-	DPrintf("[startElection] raft %v get the mutex.\n", rf.me)
 	rf.convertTo(Candidate)
 	rf.persist()
 
@@ -645,7 +644,6 @@ func (rf *Raft) startElection() {
 	DPrintf("[startElection] raft server %v start election,state: %v, currentTerm:%v\n", rf.me, rf.state, rf.currentTerm)
 
 	rf.mu.Unlock()
-	DPrintf("[startElection] raft %v release the mutex\n", rf.me)
 
 	var onceLeader = &sync.Once{}
 
