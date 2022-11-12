@@ -58,6 +58,33 @@ type LogEntry struct {
 	Command interface{}
 }
 
+type LogType struct {
+	logs             []LogEntry
+	lastIncludeIndex int
+	lastIncludeTerm  int
+}
+
+func (l *LogType) index(index int) LogEntry {
+	if index > l.lastIncludeIndex+len(l.logs) {
+		panic("Error: index is out of bounds")
+	} else if index < l.lastIncludeIndex {
+		panic("Error: index is less than lastIncludeIndex")
+	} else if index == l.lastIncludeIndex {
+		return LogEntry{Term: l.lastIncludeTerm, Command: nil}
+	}
+
+	return l.logs[index-l.lastIncludeIndex-1]
+}
+
+func (l *LogType) lastIndex() int {
+	return l.lastIncludeIndex + len(l.logs)
+}
+
+func (l *LogType) lastTerm() int {
+	logEntry := l.index(l.lastIndex())
+	return logEntry.Term
+}
+
 const (
 	Follow    = 1
 	Candidate = 2
@@ -92,11 +119,12 @@ type Raft struct {
 
 	nextIndex   []int
 	matchIndex  []int
-	log         []LogEntry
+	log         LogType
 	commitIndex int
 	lastApplied int
 
-	applyCh chan ApplyMsg
+	applyCh  chan ApplyMsg
+	snapshot []byte
 }
 
 // timeout start to election
@@ -194,7 +222,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm int
 	var voteFor int
-	var logs []LogEntry
+	var logs LogType
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&voteFor) != nil ||
 		d.Decode(&logs) != nil {
@@ -223,7 +251,30 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if index <= rf.log.lastIncludeIndex {
+		DPrintf("[Snapshot] raft %v index: %v,lastIncludeIndex: %v\n", rf.me, index, rf.log.lastIncludeIndex)
+		return
+	}
+
+	rf.log.logs = append([]LogEntry(nil), rf.log.logs[index-rf.log.lastIncludeIndex:]...)
+	rf.log.lastIncludeIndex = index
+	rf.log.lastIncludeTerm = rf.log.index(index).Term
+	rf.snapshot = snapshot
+	rf.persistStateAndSnapshot(snapshot)
+}
+
+func (rf *Raft) persistStateAndSnapshot(snapshot []byte) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
 }
 
 func (rf *Raft) applyEntries() {
@@ -233,7 +284,7 @@ func (rf *Raft) applyEntries() {
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		applyMsg := ApplyMsg{
 			CommandValid: true,
-			Command:      rf.log[i].Command,
+			Command:      rf.log.index(i).Command,
 			CommandIndex: i,
 		}
 
@@ -288,20 +339,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
 	// 需要比较前一条日志的索引和term，需要保证有这个索引和term都可以对应上，这样保证了所有的日志都是同步了
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex > rf.log.lastIndex() || rf.log.index(args.PrevLogIndex).Term != args.PrevLogTerm {
 		DPrintf("[AppendEntries] server %v reject %v append,prevLogIndex and prevLogTerm conflict,"+
 			" len(rf.log): %v, args.PrevLogIndex: %v, args.PrevLogTerm: %v\n",
-			rf.me, args.LeaderId, len(rf.log), args.PrevLogIndex, args.PrevLogTerm)
+			rf.me, args.LeaderId, rf.log.lastIndex(), args.PrevLogIndex, args.PrevLogTerm)
 		reply.Term = rf.currentTerm
 		reply.Success = false
 
 		// 以下操作是为了尽可能尽快找到矛盾点
-		if len(rf.log) <= args.PrevLogIndex {
-			reply.ConflictIndex = len(rf.log)
+		if rf.log.lastIndex() <= args.PrevLogIndex {
+			reply.ConflictIndex = rf.log.lastIndex()
 		} else {
 			// 无需一步一步的递减索引，可以直接找到当前term的最开始的索引进行重试，虽然不一定是刚好的矛盾点，但是却可以大幅度缩短重试次数
 			for i := args.PrevLogIndex; i >= 0; i-- {
-				if rf.log[i].Term != rf.log[i-1].Term {
+				if rf.log.index(i).Term != rf.log.index(i-1).Term {
 					reply.ConflictIndex = i
 					break
 				}
@@ -316,10 +367,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	isMatch := true
 	nextIndex := args.PrevLogIndex + 1
 	conflictIndex := 0
-	logLen := len(rf.log)
+	logLen := rf.log.lastIndex()
 	entryLen := len(args.Entries)
 	for i := 0; isMatch && i < entryLen; i++ {
-		if ((logLen - 1) < (nextIndex + i)) || rf.log[nextIndex+i].Term != args.Entries[i].Term {
+		if ((logLen - 1) < (nextIndex + i)) || rf.log.index(nextIndex+i).Term != args.Entries[i].Term {
 			isMatch = false
 			conflictIndex = i
 			break
@@ -329,7 +380,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if !isMatch {
 		// [0, nextIndex + conflictIndex) + [conflictIndex,len(entries)-1)
 		// 前面不矛盾的加上后面矛盾的就是当前的最新的日志
-		rf.log = append(rf.log[:nextIndex+conflictIndex], args.Entries[conflictIndex:]...)
+		rf.log.logs = append(rf.log.logs[:nextIndex+conflictIndex], args.Entries[conflictIndex:]...)
 		rf.persist()
 		DPrintf("[AppendEntries] raft %v append entries from leader\n", rf.me)
 	}
@@ -359,10 +410,10 @@ func (rf *Raft) sendAppendEntries(serverId int, args *AppendEntriesArgs, reply *
 
 // checkN check have a half of peers
 func (rf *Raft) checkN() {
-	for N := len(rf.log) - 1; N > rf.commitIndex && rf.log[N].Term == rf.currentTerm; N-- {
+	for N := rf.log.lastIndex(); N > rf.commitIndex && rf.log.index(N).Term == rf.currentTerm; N-- {
 		nReplicated := 0
 		for i := 0; i < len(rf.peers); i++ {
-			if rf.matchIndex[i] >= N && rf.log[N].Term == rf.currentTerm {
+			if rf.matchIndex[i] >= N && rf.log.index(N).Term == rf.currentTerm {
 				nReplicated += 1
 			}
 			if nReplicated > len(rf.peers)/2 {
@@ -457,7 +508,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 			rf.convertTo(Leader)
 			DPrintf("[sendRequestVote] server %v become leader\n", rf.me)
 			for i := 0; i < len(rf.peers); i++ {
-				rf.nextIndex[i] = len(rf.log)
+				rf.nextIndex[i] = rf.log.lastIndex() + 1
 				rf.matchIndex[i] = 0
 			}
 			rf.mu.Unlock()
@@ -489,13 +540,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	lastLogIndex := len(rf.log) - 1
+	lastLogIndex := rf.log.lastIndex()
 	// 拒绝投票的情况如下
 	// 1、最新的term大于请求方的最新的term（小于的情况在这之前讨论过了）
 	// 2、在term相等的情况下，日志的最大索引大于请求方的最大的日志索引
 	// 3、以上，说明所有的情况都讨论完成了
-	isLatest := rf.log[lastLogIndex].Term > args.LastLogTerm ||
-		(rf.log[lastLogIndex].Term == args.LastLogTerm && args.LastLogIndex < lastLogIndex)
+	isLatest := rf.log.index(lastLogIndex).Term > args.LastLogTerm ||
+		(rf.log.index(lastLogIndex).Term == args.LastLogTerm && args.LastLogIndex < lastLogIndex)
 
 	// 如果自身的状态比请求的节点的日志更新，那么就拒绝投票
 	if isLatest {
@@ -557,10 +608,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	if term, isLeader = rf.GetState(); isLeader {
 		rf.mu.Lock()
-		rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
+		index := rf.log.lastIndex() + 1
+		rf.log.logs = append(rf.log.logs, LogEntry{rf.currentTerm, command})
 		rf.persist()
-		rf.matchIndex[rf.me] = rf.nextIndex[rf.me] + len(rf.log) - 1
-		index = len(rf.log) - 1
+		rf.matchIndex[rf.me] = index
 		DPrintf("[Start] raft %v replicate log,state: %v,currentTerm:%v,index:%v\n", rf.me, rf.state, rf.currentTerm, index)
 		rf.mu.Unlock()
 	}
@@ -591,8 +642,8 @@ func (rf *Raft) broadcastHeartbeat() {
 					Term:         rf.currentTerm,
 					LeaderId:     rf.me,
 					PrevLogIndex: rf.nextIndex[i] - 1,
-					PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
-					Entries:      rf.log[rf.nextIndex[i]:],
+					PrevLogTerm:  rf.log.index(rf.nextIndex[i] - 1).Term,
+					Entries:      rf.log.logs[rf.nextIndex[i]:],
 					LeaderCommit: rf.commitIndex,
 				}
 				reply := &AppendEntriesReply{}
@@ -663,8 +714,8 @@ func (rf *Raft) startElection() {
 			args := &RequestVoteArgs{
 				Term:         rf.currentTerm,
 				CandidateId:  rf.me,
-				LastLogIndex: len(rf.log) - 1,
-				LastLogTerm:  rf.log[len(rf.log)-1].Term,
+				LastLogIndex: rf.log.lastIndex(),
+				LastLogTerm:  rf.log.lastTerm(),
 			}
 			reply := &RequestVoteReply{}
 			rf.mu.Unlock()
@@ -734,6 +785,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+	rf.snapshot = persister.ReadSnapshot()
+
 	// Your initialization code here (2A, 2B, 2C).
 	rf.state = Follow
 	rf.currentTerm = 0
@@ -743,15 +798,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.resetTimerHeartbeat()
 	rf.resetChannel()
 	rf.commitIndex = 0
-	rf.lastApplied = 0
+	rf.lastApplied = rf.log.lastIncludeIndex
 	rf.applyCh = applyCh
-	rf.log = make([]LogEntry, 0)
-	rf.log = append(rf.log, LogEntry{Term: 0})
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	DPrintf("Starting a raft: %v\n", rf.me)
 	// start ticker goroutine to start elections
