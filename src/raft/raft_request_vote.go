@@ -159,11 +159,12 @@ func (rf *Raft) startElection() {
 	for i := range rf.peers {
 		if i != rf.me {
 			rf.mu.Lock()
+			lastIndex := rf.log.lastIndex()
 			args := &RequestVoteArgs{
 				Term:         rf.currentTerm,
 				CandidateId:  rf.me,
 				LastLogIndex: rf.log.lastIndex(),
-				LastLogTerm:  rf.log.lastTerm(),
+				LastLogTerm:  rf.log.index(lastIndex).Term,
 			}
 			reply := &RequestVoteReply{}
 			rf.mu.Unlock()

@@ -22,7 +22,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	if args.Term < rf.currentTerm {
 		rf.mu.Unlock()
-		DPrintf("[InstallSnapshot] raft %v installsnapshot error, args.Term: %v, rf.currentTerm: %v\n", rf.me, args.Term, rf.currentTerm)
+		DPrintf("[InstallSnapshot] raft %v InstallSnapshot error, args.Term: %v, rf.currentTerm: %v\n", rf.me, args.Term, rf.currentTerm)
 		return
 	}
 
@@ -40,9 +40,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		}
 	}
 
-	if args.LastIncludeIndex <= rf.log.LastIncludeIndex {
+	if args.LastIncludeIndex <= rf.log.Base {
 		DPrintf("[InstallSnapshot] raft %v fail, args.LastIncludeIndex: %v, rf.log.LastIncludeIndex: %v\n",
-			rf.me, args.LastIncludeIndex, rf.log.LastIncludeIndex)
+			rf.me, args.LastIncludeIndex, rf.log.Base)
 		rf.mu.Unlock()
 		return
 	}
@@ -56,7 +56,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	rf.mu.Unlock()
 
-	rf.applyCh <- msg
+	go func() {
+		rf.applyCh <- msg
+	}()
 
 }
 
@@ -91,8 +93,8 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 // have more recent info since it communicate the snapshot on applyCh.
 //
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-	DPrintf("[CondInstallSnapshot] call raft %v CondInstallSnapshot, lastIncludeIndexTerm: %v, lastIncludeIndex: %v\n",
-		rf.me, lastIncludedTerm, lastIncludedIndex)
+	DPrintf("[CondInstallSnapshot] call raft %v CondInstallSnapshot, lastIncludeIndexTerm: %v, lastIncludeIndex: %v, logs: %v\n",
+		rf.me, lastIncludedTerm, lastIncludedIndex, rf.log.Logs)
 
 	// Your code here (2D).
 	rf.mu.Lock()
@@ -103,28 +105,20 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 		return false
 	}
 
-	defer func() {
-		rf.log.LastIncludeIndex = lastIncludedIndex
-		rf.log.LastIncludeTerm = lastIncludedTerm
-		rf.snapshot = snapshot
-		rf.commitIndex = lastIncludedIndex
-		rf.lastApplied = lastIncludedIndex
-		rf.persistStateAndSnapshot(snapshot)
-	}()
-	index1 := 0
-	if rf.log.LastIncludeIndex == 0 {
-		index1 = lastIncludedIndex - rf.log.LastIncludeIndex + 1
-	} else {
-		index1 = lastIncludedIndex - rf.log.LastIncludeIndex
-	}
-
 	if lastIncludedIndex <= rf.log.lastIndex() && rf.log.index(lastIncludedIndex).Term == lastIncludedTerm {
-		rf.log.Logs = append([]LogEntry(nil), rf.log.Logs[index1:]...)
-		rf.mu.Unlock()
-		return true
+		rf.log.Logs = append([]LogEntry(nil), rf.log.Logs[(lastIncludedIndex-rf.log.Base):]...)
+		rf.log.Logs = append([]LogEntry{{Term: lastIncludedTerm}}, rf.log.Logs...)
+	} else {
+		rf.log.Logs = append([]LogEntry(nil), LogEntry{Term: lastIncludedTerm})
 	}
 
-	rf.log.Logs = make([]LogEntry, 0)
+	rf.log.Base = lastIncludedIndex
+	rf.log.Logs[0].Term = lastIncludedTerm
+	rf.snapshot = snapshot
+	rf.commitIndex = lastIncludedIndex
+	rf.lastApplied = lastIncludedIndex
+
+	rf.persistStateAndSnapshot(snapshot)
 
 	return true
 }
@@ -140,22 +134,21 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.mu.Unlock()
 
 	// 如果这个下标小于之前已经快照的下标，说明不能被提交
-	// 如果下标超过了这个节点的最后向service的提交下标，同样不能被快照
-	if index <= rf.log.LastIncludeIndex || index > rf.lastApplied {
-		DPrintf("[Snapshot] raft %v index: %v,LastIncludeIndex: %v\n", rf.me, index, rf.log.LastIncludeIndex)
+	// 如果下标超过了这个节点的最后向service的提交下标，理应不能被快照
+	if index <= rf.log.Base || index > rf.lastApplied {
+		DPrintf("[Snapshot] raft %v index: %v,LastIncludeIndex: %v\n", rf.me, index, rf.log.Base)
 		return
 	}
 
-	index1 := 0
-	if rf.log.LastIncludeIndex == 0 {
-		index1 = index - rf.log.LastIncludeIndex + 1
-	} else {
-		index1 = index - rf.log.LastIncludeIndex
-	}
-	rf.log.LastIncludeTerm = rf.log.index(index).Term
-	rf.log.LastIncludeIndex = index
-	rf.log.Logs = append([]LogEntry(nil), rf.log.Logs[index1:]...)
+	lastIncludeTerm := rf.log.index(index).Term
+	lastIncludeIndex := index
+	// (index,...],for GC
+	rf.log.Logs = append([]LogEntry(nil), rf.log.Logs[(index-rf.log.Base+1):]...)
+	// append a elem in front of the slice
+	rf.log.Logs = append([]LogEntry{{Term: lastIncludeTerm}}, rf.log.Logs...)
+	rf.log.Base = lastIncludeIndex
 	rf.snapshot = snapshot
+
 	rf.persist()
 	rf.persistStateAndSnapshot(snapshot)
 	DPrintf("[Snapshot] after raft %v snapshot, log: %v", rf.me, rf.log.Logs)

@@ -21,7 +21,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	DPrintf("[AppendEntries] raft %v received raft %v appendEntries\n", rf.me, args.LeaderId)
 	DPrintf("[AppendEntries] raft %v debug entries: %v, log: %v, rf.lastIncludeIndex:%v, rf.lastIncludeTerm: %v",
-		rf.me, args.Entries, rf.log.Logs, rf.log.LastIncludeIndex, rf.log.LastIncludeTerm)
+		rf.me, args.Entries, rf.log.Logs, rf.log.Base, rf.log.Logs[0].Term)
 	// Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -53,8 +53,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 
 		// 以下操作是为了尽可能尽快找到矛盾点
-		if rf.log.lastIndex() <= args.PrevLogIndex {
-			reply.ConflictIndex = rf.log.lastIndex()
+		if rf.log.lastIndex()+1 <= args.PrevLogIndex {
+			reply.ConflictIndex = rf.log.lastIndex() + 1
 		} else {
 			// 无需一步一步的递减索引，可以直接找到当前term的最开始的索引进行重试，虽然不一定是刚好的矛盾点，但是却可以大幅度缩短重试次数
 			for i := args.PrevLogIndex; i >= 0; i-- {
@@ -74,13 +74,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	nextIndex := args.PrevLogIndex + 1
 	conflictIndex := 0
 	// 当前节点的所有的日志的长度
-	logLen := rf.log.logLen()
-	DPrintf("[Debug] nextIndex: %v, logLen: %v", nextIndex, logLen)
+	lastIndex := rf.log.lastIndex()
+	DPrintf("[Debug] nextIndex: %v, lastIndex: %v", nextIndex, lastIndex)
 	entryLen := len(args.Entries)
 	for i := 0; isMatch && i < entryLen; i++ {
 		// 1、索引下标超过了follow日志的最大索引
 		// 2、在相同索引地方的选举周期不一致
-		if ((logLen - 1) < (nextIndex + i)) || rf.log.index(nextIndex+i).Term != args.Entries[i].Term {
+		if (lastIndex < (nextIndex + i)) || rf.log.index(nextIndex+i).Term != args.Entries[i].Term {
 			isMatch = false
 			conflictIndex = i
 			break
@@ -90,15 +90,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if !isMatch {
 		// [0, nextIndex + conflictIndex) + [conflictIndex,len(entries)-1)
 		// 前面不矛盾的加上后面矛盾的就是当前的最新的日志
-		index := 0
-		if rf.log.LastIncludeIndex == 0 {
-			index = nextIndex + conflictIndex
-		} else {
-			index = nextIndex + conflictIndex - rf.log.LastIncludeIndex - 1
-		}
 		DPrintf("[AppendEntries] raft %v, nextIndex: %v, conflictIndex: %v", rf.me, nextIndex, conflictIndex)
 		// 新的日志为[0,index)+[conflictIndex....]
-		rf.log.Logs = append(rf.log.Logs[:index], args.Entries[conflictIndex:]...)
+		rf.log.Logs = append(rf.log.Logs[:(nextIndex+conflictIndex-rf.log.Base)], args.Entries[conflictIndex:]...)
 		rf.persist()
 		DPrintf("[AppendEntries] raft %v append entries from leader\n", rf.me)
 	}
@@ -147,16 +141,16 @@ func (rf *Raft) broadcastHeartbeat() {
 				rf.mu.Lock()
 				// 2D test, snapshot,if PrevLogIndex < rf.log.LastIncludeIndex
 				prevLogIndex := rf.nextIndex[i] - 1
-				DPrintf("[broadcastHeartbeat] snapshot check, prevLogIndex:%v, lastIncludeIndex: %v", prevLogIndex, rf.log.LastIncludeIndex)
+				DPrintf("[broadcastHeartbeat] snapshot check, prevLogIndex:%v, lastIncludeIndex: %v", prevLogIndex, rf.log.Base)
 				rf.mu.Unlock()
-				if prevLogIndex < rf.log.LastIncludeIndex {
+				if prevLogIndex < rf.log.Base {
 					go func(i int) {
 						rf.mu.Lock()
 						args := InstallSnapshotArgs{
 							Term:             rf.currentTerm,
 							LeaderId:         rf.me,
-							LastIncludeIndex: rf.log.LastIncludeIndex,
-							LastIncludedTerm: rf.log.LastIncludeTerm,
+							LastIncludeIndex: rf.log.Base,
+							LastIncludedTerm: rf.log.Logs[0].Term,
 							Data:             rf.snapshot,
 						}
 						rf.mu.Unlock()
@@ -167,18 +161,12 @@ func (rf *Raft) broadcastHeartbeat() {
 				}
 
 				rf.mu.Lock()
-				index := 0
-				if rf.log.LastIncludeIndex == 0 {
-					index = rf.nextIndex[i]
-				} else {
-					index = rf.nextIndex[i] - rf.log.LastIncludeIndex - 1
-				}
 				args := &AppendEntriesArgs{
 					Term:         rf.currentTerm,
 					LeaderId:     rf.me,
 					PrevLogIndex: rf.nextIndex[i] - 1,
 					PrevLogTerm:  rf.log.index(rf.nextIndex[i] - 1).Term,
-					Entries:      rf.log.Logs[index:],
+					Entries:      rf.log.Logs[(rf.nextIndex[i] - rf.log.Base):],
 					LeaderCommit: rf.commitIndex,
 				}
 				reply := &AppendEntriesReply{}
@@ -200,7 +188,6 @@ func (rf *Raft) broadcastHeartbeat() {
 						DPrintf("[broadcastHeartbeat] success, server %v received %v entries\n", i, rf.me)
 						rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
 						rf.nextIndex[i] = rf.matchIndex[i] + 1
-						DPrintf("[Debug] server %v matchIndex:%v", i, rf.matchIndex[i])
 						rf.checkN()
 					} else {
 						DPrintf("[broadcastHeartbeat] fail, state: %v, term: %v\n", rf.state, rf.currentTerm)

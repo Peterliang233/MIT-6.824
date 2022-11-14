@@ -59,60 +59,24 @@ type LogEntry struct {
 }
 
 type LogType struct {
-	Logs             []LogEntry
-	LastIncludeIndex int
-	LastIncludeTerm  int
-}
-
-func (l *LogType) index(index int) LogEntry {
-	//DPrintf("[index] index: %v, lastIncludeIndex:%v, len: %v\n", index, l.LastIncludeIndex, len(l.Logs))
-	if l.LastIncludeIndex == 0 {
-		return l.Logs[index]
-	}
-	if index > l.lastIndex() {
-		DPrintf("[index] index is out of bound, index: %v,len: %v\n", index, l.lastIndex())
-		panic("Error: index is out of bounds")
-	} else if index < l.LastIncludeIndex {
-		DPrintf("[index] index is less than LastIncludeIndex, index: %v, len: %v\n", index, l.LastIncludeIndex)
-		panic("Error: index is less than LastIncludeIndex")
-	} else if index == l.LastIncludeIndex {
-		return LogEntry{Term: l.LastIncludeTerm, Command: nil}
-	}
-	return l.Logs[index-l.LastIncludeIndex-1]
-}
-
-// 原索引映射改造之后的索引
-func (l *LogType) getNowIndex(index int) int {
-	if l.LastIncludeIndex == 0 {
-		return index
-	}
-	if index > l.lastIndex() {
-		panic("No such Index")
-	} else if index <= l.LastIncludeIndex {
-		panic("the index is less than LastIncludeIndex")
-	} else {
-		return index - l.LastIncludeIndex - 1
-	}
+	Logs []LogEntry // Logs[0] is the LastIncludeLog,so Logs[0].Term is LastIncludeTerm
+	Base int        // Base is LastIncludeIndex
 }
 
 func (l *LogType) lastIndex() int {
-	if l.LastIncludeIndex == 0 {
-		return len(l.Logs) - 1
-	} else {
-		return l.LastIncludeIndex + len(l.Logs)
-	}
+	return l.Base + len(l.Logs) - 1
 }
 
-func (l *LogType) logLen() int {
-	if l.LastIncludeIndex == 0 {
-		return len(l.Logs)
+func (l *LogType) index(index int) LogEntry {
+	if index > l.lastIndex() {
+		panic("index is more than lastIndex.")
+	} else if index < l.Base {
+		panic("index is not more than Base.")
+	} else if index == l.Base {
+		return LogEntry{Term: l.Logs[0].Term, Command: nil}
 	}
-	return l.LastIncludeIndex + 1 + len(l.Logs)
-}
 
-func (l *LogType) lastTerm() int {
-	logEntry := l.index(l.lastIndex())
-	return logEntry.Term
+	return l.Logs[index-l.Base]
 }
 
 const (
@@ -299,21 +263,12 @@ func (rf *Raft) applyEntries() {
 	}
 }
 
-func (rf *Raft) transN(index int) int {
-	if rf.log.LastIncludeIndex == 0 {
-		return index
-	}
-	return index - rf.log.LastIncludeIndex - 1
-}
-
 // checkN check have a half of peers
 func (rf *Raft) checkN() {
-	//DPrintf("[Debug] N: %v, commitIndex: %v,term1: %v, term2: %v logs: %v, transN: %v",
-	//rf.log.lastIndex(), rf.commitIndex, rf.log.Logs[rf.transN(rf.log.lastIndex())].Term, rf.currentTerm, rf.log.Logs, rf.transN(rf.log.lastIndex()))
-	for N := rf.log.lastIndex(); N > rf.commitIndex && rf.log.Logs[rf.transN(N)].Term == rf.currentTerm; N-- {
+	for N := rf.log.lastIndex(); N > rf.commitIndex && rf.log.Logs[N-rf.log.Base].Term == rf.currentTerm; N-- {
 		nReplicated := 0
 		for i := 0; i < len(rf.peers); i++ {
-			if rf.matchIndex[i] >= N && rf.log.Logs[rf.transN(N)].Term == rf.currentTerm {
+			if rf.matchIndex[i] >= N && rf.log.Logs[N-rf.log.Base].Term == rf.currentTerm {
 				nReplicated += 1
 			}
 			if nReplicated > len(rf.peers)/2 {
@@ -444,6 +399,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// initialize from state persisted before a crash
+	rf.log.Logs = append(rf.log.Logs, LogEntry{Term: 0, Command: nil})
+	rf.log.Base = 0
 	rf.readPersist(persister.ReadRaftState())
 	rf.snapshot = persister.ReadSnapshot()
 
@@ -456,9 +413,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.resetTimerHeartbeat()
 	rf.resetChannel()
 	rf.commitIndex = 0
-	rf.lastApplied = rf.log.LastIncludeIndex
+	rf.lastApplied = rf.log.Base
 	rf.applyCh = applyCh
-	rf.log.Logs = append(rf.log.Logs, LogEntry{Term: 0})
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 
