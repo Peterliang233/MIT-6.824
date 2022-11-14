@@ -59,25 +59,55 @@ type LogEntry struct {
 }
 
 type LogType struct {
-	logs             []LogEntry
-	lastIncludeIndex int
-	lastIncludeTerm  int
+	Logs             []LogEntry
+	LastIncludeIndex int
+	LastIncludeTerm  int
 }
 
 func (l *LogType) index(index int) LogEntry {
-	if index > l.lastIncludeIndex+len(l.logs) {
-		panic("Error: index is out of bounds")
-	} else if index < l.lastIncludeIndex {
-		panic("Error: index is less than lastIncludeIndex")
-	} else if index == l.lastIncludeIndex {
-		return LogEntry{Term: l.lastIncludeTerm, Command: nil}
+	//DPrintf("[index] index: %v, lastIncludeIndex:%v, len: %v\n", index, l.LastIncludeIndex, len(l.Logs))
+	if l.LastIncludeIndex == 0 {
+		return l.Logs[index]
 	}
+	if index > l.lastIndex() {
+		DPrintf("[index] index is out of bound, index: %v,len: %v\n", index, l.lastIndex())
+		panic("Error: index is out of bounds")
+	} else if index < l.LastIncludeIndex {
+		DPrintf("[index] index is less than LastIncludeIndex, index: %v, len: %v\n", index, l.LastIncludeIndex)
+		panic("Error: index is less than LastIncludeIndex")
+	} else if index == l.LastIncludeIndex {
+		return LogEntry{Term: l.LastIncludeTerm, Command: nil}
+	}
+	return l.Logs[index-l.LastIncludeIndex-1]
+}
 
-	return l.logs[index-l.lastIncludeIndex-1]
+// 原索引映射改造之后的索引
+func (l *LogType) getNowIndex(index int) int {
+	if l.LastIncludeIndex == 0 {
+		return index
+	}
+	if index > l.lastIndex() {
+		panic("No such Index")
+	} else if index <= l.LastIncludeIndex {
+		panic("the index is less than LastIncludeIndex")
+	} else {
+		return index - l.LastIncludeIndex - 1
+	}
 }
 
 func (l *LogType) lastIndex() int {
-	return l.lastIncludeIndex + len(l.logs)
+	if l.LastIncludeIndex == 0 {
+		return len(l.Logs) - 1
+	} else {
+		return l.LastIncludeIndex + len(l.Logs)
+	}
+}
+
+func (l *LogType) logLen() int {
+	if l.LastIncludeIndex == 0 {
+		return len(l.Logs)
+	}
+	return l.LastIncludeIndex + 1 + len(l.Logs)
 }
 
 func (l *LogType) lastTerm() int {
@@ -234,38 +264,6 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
-//
-// A service wants to switch to snapshot.  Only do so if Raft hasn't
-// have more recent info since it communicate the snapshot on applyCh.
-//
-func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
-	// Your code here (2D).
-
-	return true
-}
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if index <= rf.log.lastIncludeIndex {
-		DPrintf("[Snapshot] raft %v index: %v,lastIncludeIndex: %v\n", rf.me, index, rf.log.lastIncludeIndex)
-		return
-	}
-
-	rf.log.logs = append([]LogEntry(nil), rf.log.logs[index-rf.log.lastIncludeIndex:]...)
-	rf.log.lastIncludeIndex = index
-	rf.log.lastIncludeTerm = rf.log.index(index).Term
-	rf.snapshot = snapshot
-	rf.persistStateAndSnapshot(snapshot)
-}
-
 func (rf *Raft) persistStateAndSnapshot(snapshot []byte) {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -281,6 +279,8 @@ func (rf *Raft) applyEntries() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// 在这个过程中可能会出现锁被抢占，导致部分日志被快照处理了，
+	// 那么可能会出现索引找不到对应的日志的问题
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		applyMsg := ApplyMsg{
 			CommandValid: true,
@@ -288,283 +288,41 @@ func (rf *Raft) applyEntries() {
 			CommandIndex: i,
 		}
 
+		rf.mu.Unlock()
+		// 由于上层的service会调用snapshot会抢占锁，所以这里我们需要释放锁，避免造成死锁问题
 		rf.applyCh <- applyMsg
+		rf.mu.Lock()
 
 		rf.lastApplied += 1
 
-		DPrintf("[applyEntries] raft %v applied entry, lastApplied: %v, commitIndex: %v\n", rf.me, rf.lastApplied, rf.commitIndex)
+		DPrintf("[applyEntries] raft %v applied entry, lastApplied: %v, commitIndex: %v command: %v\n", rf.me, rf.lastApplied, rf.commitIndex, applyMsg.Command)
 	}
 }
 
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderId     int
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []LogEntry
-	LeaderCommit int
-}
-
-type AppendEntriesReply struct {
-	Term          int
-	Success       bool
-	ConflictIndex int
-}
-
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	DPrintf("[AppendEntries] raft %v received raft %v appendEntries\n", rf.me, args.LeaderId)
-	// Reply false if term < currentTerm
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		reply.Success = false
-		DPrintf("[AppendEntries] server %v reject %v append\n", rf.me, args.LeaderId)
-		return
+func (rf *Raft) transN(index int) int {
+	if rf.log.LastIncludeIndex == 0 {
+		return index
 	}
-
-	rf.resetTimerElection()
-
-	if args.Term > rf.currentTerm {
-		rf.convertTo(Follow)
-		rf.currentTerm = args.Term
-		rf.persist()
-		DPrintf("[AppendEntries] raft %v term is less than raft %v, args.Term: %v, rf.currentTerm: %v\n",
-			rf.me, args.LeaderId, args.Term, rf.currentTerm)
-	} else if rf.state == Candidate {
-		rf.state = Follow
-		DPrintf("[AppendEntries] raft %v convert from Candidate to Follow\n", rf.me)
-	}
-
-	// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
-	// 需要比较前一条日志的索引和term，需要保证有这个索引和term都可以对应上，这样保证了所有的日志都是同步了
-	if args.PrevLogIndex > rf.log.lastIndex() || rf.log.index(args.PrevLogIndex).Term != args.PrevLogTerm {
-		DPrintf("[AppendEntries] server %v reject %v append,prevLogIndex and prevLogTerm conflict,"+
-			" len(rf.log): %v, args.PrevLogIndex: %v, args.PrevLogTerm: %v\n",
-			rf.me, args.LeaderId, rf.log.lastIndex(), args.PrevLogIndex, args.PrevLogTerm)
-		reply.Term = rf.currentTerm
-		reply.Success = false
-
-		// 以下操作是为了尽可能尽快找到矛盾点
-		if rf.log.lastIndex() <= args.PrevLogIndex {
-			reply.ConflictIndex = rf.log.lastIndex()
-		} else {
-			// 无需一步一步的递减索引，可以直接找到当前term的最开始的索引进行重试，虽然不一定是刚好的矛盾点，但是却可以大幅度缩短重试次数
-			for i := args.PrevLogIndex; i >= 0; i-- {
-				if rf.log.index(i).Term != rf.log.index(i-1).Term {
-					reply.ConflictIndex = i
-					break
-				}
-			}
-		}
-
-		return
-	}
-
-	// If an existing entry conflict with a new one(same index but different terms), delete the existing entry and all that follow it
-	// 找到最开始矛盾的点的位置
-	isMatch := true
-	nextIndex := args.PrevLogIndex + 1
-	conflictIndex := 0
-	logLen := rf.log.lastIndex()
-	entryLen := len(args.Entries)
-	for i := 0; isMatch && i < entryLen; i++ {
-		if ((logLen - 1) < (nextIndex + i)) || rf.log.index(nextIndex+i).Term != args.Entries[i].Term {
-			isMatch = false
-			conflictIndex = i
-			break
-		}
-	}
-	// Append any new entries not already in the log.
-	if !isMatch {
-		// [0, nextIndex + conflictIndex) + [conflictIndex,len(entries)-1)
-		// 前面不矛盾的加上后面矛盾的就是当前的最新的日志
-		rf.log.logs = append(rf.log.logs[:nextIndex+conflictIndex], args.Entries[conflictIndex:]...)
-		rf.persist()
-		DPrintf("[AppendEntries] raft %v append entries from leader\n", rf.me)
-	}
-
-	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-	lastNewEntryIndex := args.PrevLogIndex + entryLen
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = Min(args.LeaderCommit, lastNewEntryIndex)
-		go rf.applyEntries()
-	}
-
-	if args.Term > rf.currentTerm || rf.state != Follow {
-		rf.convertTo(Follow)
-		rf.currentTerm = args.Term
-		rf.persist()
-		DPrintf("[AppendEntries] server %v accept %v append\n", rf.me, args.LeaderId)
-	}
-
-	reply.Term = rf.currentTerm
-	reply.Success = true
-}
-
-func (rf *Raft) sendAppendEntries(serverId int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	DPrintf("[sendAppendEntries] raft %v send appendEntries to raft %v\n", rf.me, serverId)
-	return rf.peers[serverId].Call("Raft.AppendEntries", args, reply)
+	return index - rf.log.LastIncludeIndex - 1
 }
 
 // checkN check have a half of peers
 func (rf *Raft) checkN() {
-	for N := rf.log.lastIndex(); N > rf.commitIndex && rf.log.index(N).Term == rf.currentTerm; N-- {
+	//DPrintf("[Debug] N: %v, commitIndex: %v,term1: %v, term2: %v logs: %v, transN: %v",
+	//rf.log.lastIndex(), rf.commitIndex, rf.log.Logs[rf.transN(rf.log.lastIndex())].Term, rf.currentTerm, rf.log.Logs, rf.transN(rf.log.lastIndex()))
+	for N := rf.log.lastIndex(); N > rf.commitIndex && rf.log.Logs[rf.transN(N)].Term == rf.currentTerm; N-- {
 		nReplicated := 0
 		for i := 0; i < len(rf.peers); i++ {
-			if rf.matchIndex[i] >= N && rf.log.index(N).Term == rf.currentTerm {
+			if rf.matchIndex[i] >= N && rf.log.Logs[rf.transN(N)].Term == rf.currentTerm {
 				nReplicated += 1
 			}
 			if nReplicated > len(rf.peers)/2 {
 				rf.commitIndex = N
-				DPrintf("[CheckN] raft %v start to checkN, rf.commitIndex: %v\n", rf.me, rf.commitIndex)
+				DPrintf("[CheckN] raft %v start to checkN, rf.commitIndex: %v, rf.lastApplied: %v\n", rf.me, rf.commitIndex, rf.lastApplied)
 				go rf.applyEntries()
 				break
 			}
 		}
-	}
-}
-
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
-	Term        int  // 当前这个节点的任期Id
-	VoteGranted bool // 为true说明获得了票数
-}
-
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, onceLeader *sync.Once) {
-	DPrintf("[sendRequestVote] raft %v start sendRequestVote to raft %v\n", rf.me, server)
-	if ok := rf.peers[server].Call("Raft.RequestVote", args, reply); !ok {
-		DPrintf("[sendRequestVote] raft %v call raft %v fail\n", rf.me, server)
-		return
-	}
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	// 说明请求接收方的term大于自己的term，自己的term不是最新的term,需要逐步同步
-	if reply.Term > rf.currentTerm {
-		rf.convertTo(Follow)
-		rf.currentTerm = reply.Term
-		rf.persist()
-		return
-	}
-
-	if !reply.VoteGranted {
-		return
-	}
-
-	rf.getVoteNum++
-
-	// 注意这个地方需要保证还是candidate身份
-	if rf.getVoteNum > len(rf.peers)/2 && rf.currentTerm == args.Term && rf.state == Candidate {
-		// 只执行一次
-		onceLeader.Do(func() {
-			rf.convertTo(Leader)
-			DPrintf("[sendRequestVote] server %v become leader\n", rf.me)
-			for i := 0; i < len(rf.peers); i++ {
-				rf.nextIndex[i] = rf.log.lastIndex() + 1
-				rf.matchIndex[i] = 0
-			}
-			rf.mu.Unlock()
-			go rf.broadcastHeartbeat()
-			rf.mu.Lock()
-		})
-	}
-
-}
-
-//
-// example RequestVote RPC handler.
-//
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if args.Term > rf.currentTerm {
-		// 如果请求的term大于自身的term,说明自身慢于发起请求的这个节点，需要改变为follow节点
-		rf.convertTo(Follow)
-		rf.currentTerm = args.Term
-		rf.persist()
-	}
-	// Your code here (2A, 2B).
-	if rf.currentTerm > args.Term || (rf.voteFor != -1 && rf.voteFor != args.CandidateId) {
-		DPrintf("[RequestVote] raft %v reject vote for %v, state: %v, currentTerm: %v, args.Term:%v\n", rf.me, args.CandidateId,
-			rf.state, rf.currentTerm, args.Term)
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-		return
-	}
-
-	lastLogIndex := rf.log.lastIndex()
-	// 拒绝投票的情况如下
-	// 1、最新的term大于请求方的最新的term（小于的情况在这之前讨论过了）
-	// 2、在term相等的情况下，日志的最大索引大于请求方的最大的日志索引
-	// 3、以上，说明所有的情况都讨论完成了
-	isLatest := rf.log.index(lastLogIndex).Term > args.LastLogTerm ||
-		(rf.log.index(lastLogIndex).Term == args.LastLogTerm && args.LastLogIndex < lastLogIndex)
-
-	// 如果自身的状态比请求的节点的日志更新，那么就拒绝投票
-	if isLatest {
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-		return
-	}
-
-	// 这个地方需要保证发起请求的term大于自己的term，或者在term相等的情况下，日志的最大索引大于自身的日志的最大索引。
-	// 这里需要注意在同一个term下面可能出现多条日志。
-	if rf.voteFor == -1 || rf.voteFor == args.CandidateId {
-		reply.VoteGranted = true
-		reply.Term = rf.currentTerm
-		rf.voteFor = args.CandidateId
-		rf.persist()
-		rf.resetTimerElection()
-		// 给自己的channel发送一个信息提示投票了
-		DPrintf("[RequestVote] server %v success vote for %v\n", rf.me, args.CandidateId)
 	}
 }
 
@@ -608,121 +366,21 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	if term, isLeader = rf.GetState(); isLeader {
 		rf.mu.Lock()
-		index := rf.log.lastIndex() + 1
-		rf.log.logs = append(rf.log.logs, LogEntry{rf.currentTerm, command})
+		rf.log.Logs = append(rf.log.Logs, LogEntry{rf.currentTerm, command})
+		index = rf.log.lastIndex()
 		rf.persist()
-		rf.matchIndex[rf.me] = index
-		DPrintf("[Start] raft %v replicate log,state: %v,currentTerm:%v,index:%v\n", rf.me, rf.state, rf.currentTerm, index)
+		rf.matchIndex[rf.me] = rf.log.lastIndex()
+		DPrintf("[Start] raft %v replicate log,state: %v,currentTerm:%v,index:%v,command: %v, logs: %v\n",
+			rf.me, rf.state, rf.currentTerm, index, command, rf.log.Logs)
 		rf.mu.Unlock()
 	}
 
 	return index, term, isLeader
 }
 
-func (rf *Raft) broadcastHeartbeat() {
-	DPrintf("[broadcastHeartbeat] server %v start to broadcastHeartbeat\n", rf.me)
-	rf.mu.Lock()
-	state := rf.state
-	if state != Leader {
-		DPrintf("[broadcastHeartbeat] server %v not leader,cannot broadcast heartBeat.\n", rf.me)
-		rf.mu.Unlock()
-		return
-	}
-
-	rf.resetTimerHeartbeat()
-	rf.mu.Unlock()
-
-	// 给其他每个节点发送一个心跳,证明Leader自己是还存活的,以及更新日志
-	for i := range rf.peers {
-		if i != rf.me {
-			go func(i int) {
-			retry:
-				rf.mu.Lock()
-				args := &AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					LeaderId:     rf.me,
-					PrevLogIndex: rf.nextIndex[i] - 1,
-					PrevLogTerm:  rf.log.index(rf.nextIndex[i] - 1).Term,
-					Entries:      rf.log.logs[rf.nextIndex[i]:],
-					LeaderCommit: rf.commitIndex,
-				}
-				reply := &AppendEntriesReply{}
-				rf.mu.Unlock()
-				if rf.sendAppendEntries(i, args, reply) {
-					rf.mu.Lock()
-					if rf.state != Leader {
-						DPrintf("[broadcastHeartbeat] lost leadership: state:%v, term:%v\n", rf.state, rf.currentTerm)
-						rf.mu.Unlock()
-						return
-					}
-					if rf.currentTerm != args.Term {
-						DPrintf("[broadcastHeartbeat] raft %v node term inconsistency: currentTerm:%v, args.Term:%v, state: %v\n", rf.me, rf.currentTerm,
-							args.Term, rf.state)
-						rf.mu.Unlock()
-						return
-					}
-					if reply.Success {
-						DPrintf("[broadcastHeartbeat] success, server %v received %v entries\n", i, rf.me)
-						rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
-						rf.nextIndex[i] = rf.matchIndex[i] + 1
-						rf.checkN()
-					} else {
-						DPrintf("[broadcastHeartbeat] fail, state: %v, term: %v\n", rf.state, rf.currentTerm)
-						if reply.Term > rf.currentTerm {
-							rf.convertTo(Follow)
-							rf.currentTerm = reply.Term
-							rf.persist()
-							rf.mu.Unlock()
-							return
-						}
-
-						rf.nextIndex[i] = reply.ConflictIndex
-						DPrintf("[broadcastHeartbeat] raft %v append entries to %v reject: decrement nextIndex and retry\n", rf.me, i)
-						rf.mu.Unlock()
-						goto retry
-					}
-					rf.mu.Unlock()
-				} else {
-					DPrintf("[broadcastHeartbeat] raft %v call raft %v Raft.AppendEntries failed\n", rf.me, i)
-				}
-			}(i)
-		}
-	}
-}
-
 func (rf *Raft) resetChannel() {
 	rf.timerElectionChan = make(chan bool)
 	rf.timerHeartbeatChan = make(chan bool)
-	rf.applyCh = make(chan ApplyMsg)
-}
-
-func (rf *Raft) startElection() {
-	rf.mu.Lock()
-	rf.convertTo(Candidate)
-
-	rf.getVoteNum = 1
-
-	DPrintf("[startElection] raft server %v start election,state: %v, currentTerm:%v\n", rf.me, rf.state, rf.currentTerm)
-
-	rf.mu.Unlock()
-
-	var onceLeader = &sync.Once{}
-
-	for i := range rf.peers {
-		if i != rf.me {
-			rf.mu.Lock()
-			args := &RequestVoteArgs{
-				Term:         rf.currentTerm,
-				CandidateId:  rf.me,
-				LastLogIndex: rf.log.lastIndex(),
-				LastLogTerm:  rf.log.lastTerm(),
-			}
-			reply := &RequestVoteReply{}
-			rf.mu.Unlock()
-			go rf.sendRequestVote(i, args, reply, onceLeader)
-		}
-	}
-
 }
 
 //
@@ -798,8 +456,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.resetTimerHeartbeat()
 	rf.resetChannel()
 	rf.commitIndex = 0
-	rf.lastApplied = rf.log.lastIncludeIndex
+	rf.lastApplied = rf.log.LastIncludeIndex
 	rf.applyCh = applyCh
+	rf.log.Logs = append(rf.log.Logs, LogEntry{Term: 0})
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 
