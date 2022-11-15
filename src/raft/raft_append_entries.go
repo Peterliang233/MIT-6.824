@@ -47,7 +47,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 需要比较前一条日志的索引和term，需要保证有这个索引和term都可以对应上，这样保证了所有的日志都是同步了
 	if args.PrevLogIndex > rf.log.lastIndex() || rf.log.index(args.PrevLogIndex).Term != args.PrevLogTerm {
 		DPrintf("[AppendEntries] server %v reject %v append,prevLogIndex and prevLogTerm conflict,"+
-			" len(rf.log): %v, args.PrevLogIndex: %v, args.PrevLogTerm: %v\n",
+			" rf.lastIndex: %v, args.PrevLogIndex: %v, args.PrevLogTerm: %v\n",
 			rf.me, args.LeaderId, rf.log.lastIndex(), args.PrevLogIndex, args.PrevLogTerm)
 		reply.Term = rf.currentTerm
 		reply.Success = false
@@ -57,11 +57,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.ConflictIndex = rf.log.lastIndex() + 1
 		} else {
 			// 无需一步一步的递减索引，可以直接找到当前term的最开始的索引进行重试，虽然不一定是刚好的矛盾点，但是却可以大幅度缩短重试次数
-			for i := args.PrevLogIndex; i >= 0; i-- {
+			succ := false
+			for i := args.PrevLogIndex; i > rf.log.Base; i-- {
 				if rf.log.index(i).Term != rf.log.index(i-1).Term {
+					succ = true
 					reply.ConflictIndex = i
 					break
 				}
+			}
+			if !succ {
+				reply.ConflictIndex = rf.log.Base
 			}
 		}
 
@@ -109,15 +114,89 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.persist()
 	}
-	DPrintf("[AppendEntries] server %v accept %v append, now log: %v\n", rf.me, args.LeaderId, rf.log.Logs)
-
 	reply.Term = rf.currentTerm
 	reply.Success = true
+	DPrintf("[AppendEntries] server %v accept %v append, now log: %v, lastIndex: %v\n",
+		rf.me, args.LeaderId, rf.log.Logs, rf.log.lastIndex())
 }
 
 func (rf *Raft) sendAppendEntries(serverId int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	DPrintf("[sendAppendEntries] raft %v send appendEntries to raft %v\n", rf.me, serverId)
-	return rf.peers[serverId].Call("Raft.AppendEntries", args, reply)
+	ok := rf.peers[serverId].Call("Raft.AppendEntries", args, reply)
+	DPrintf("Debug: raft %v sendAppendEntries %v result: %v\n", rf.me, serverId, ok)
+	return ok
+}
+
+func (rf *Raft) ReplicationEntries(i int) bool {
+	rf.mu.Lock()
+	// 2D test, snapshot,if PrevLogIndex < rf.log.LastIncludeIndex
+	prevLogIndex := rf.nextIndex[i] - 1
+	DPrintf("[ReplicationEntries] snapshot check raft %v, prevLogIndex:%v, lastIncludeIndex: %v", i, prevLogIndex, rf.log.Base)
+	rf.mu.Unlock()
+	if prevLogIndex < rf.log.Base {
+		rf.mu.Lock()
+		args := InstallSnapshotArgs{
+			Term:             rf.currentTerm,
+			LeaderId:         rf.me,
+			LastIncludeIndex: rf.log.Base,
+			LastIncludedTerm: rf.log.Logs[0].Term,
+			Data:             rf.snapshot,
+		}
+		rf.mu.Unlock()
+		reply := InstallSnapshotReply{}
+		rf.sendInstallSnapshot(i, &args, &reply)
+		return true
+	}
+
+	rf.mu.Lock()
+	args := &AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: rf.nextIndex[i] - 1,
+		PrevLogTerm:  rf.log.index(rf.nextIndex[i] - 1).Term,
+		Entries:      rf.log.Logs[(rf.nextIndex[i] - rf.log.Base):],
+		LeaderCommit: rf.commitIndex,
+	}
+	reply := &AppendEntriesReply{}
+	rf.mu.Unlock()
+	if rf.sendAppendEntries(i, args, reply) {
+		rf.mu.Lock()
+		if rf.state != Leader {
+			DPrintf("[ReplicationEntries] lost leadership: state:%v, term:%v\n", rf.state, rf.currentTerm)
+			rf.mu.Unlock()
+			return true
+		}
+		if rf.currentTerm != args.Term {
+			DPrintf("[ReplicationEntries] raft %v node term inconsistency: currentTerm:%v, args.Term:%v, state: %v\n", rf.me, rf.currentTerm,
+				args.Term, rf.state)
+			rf.mu.Unlock()
+			return true
+		}
+		if reply.Success {
+			DPrintf("[ReplicationEntries] success, server %v received %v entries\n", i, rf.me)
+			rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
+			rf.nextIndex[i] = rf.matchIndex[i] + 1
+			rf.checkN()
+			rf.mu.Unlock()
+			return true
+		} else {
+			DPrintf("[ReplicationEntries] fail, state: %v, term: %v\n", rf.state, rf.currentTerm)
+			if reply.Term > rf.currentTerm {
+				rf.convertTo(Follow)
+				rf.currentTerm = reply.Term
+				rf.persist()
+				rf.mu.Unlock()
+				return true
+			}
+			rf.nextIndex[i] = reply.ConflictIndex
+			DPrintf("[ReplicationEntries] raft %v append entries to %v reject: decrement nextIndex and retry\n", rf.me, i)
+			rf.mu.Unlock()
+			return false
+		}
+	} else {
+		DPrintf("[ReplicationEntries] raft %v call raft %v Raft.AppendEntries failed\n", rf.me, i)
+		return true
+	}
 }
 
 func (rf *Raft) broadcastHeartbeat() {
@@ -137,76 +216,7 @@ func (rf *Raft) broadcastHeartbeat() {
 	for i := range rf.peers {
 		if i != rf.me {
 			go func(i int) {
-			retry:
-				rf.mu.Lock()
-				// 2D test, snapshot,if PrevLogIndex < rf.log.LastIncludeIndex
-				prevLogIndex := rf.nextIndex[i] - 1
-				DPrintf("[broadcastHeartbeat] snapshot check, prevLogIndex:%v, lastIncludeIndex: %v", prevLogIndex, rf.log.Base)
-				rf.mu.Unlock()
-				if prevLogIndex < rf.log.Base {
-					go func(i int) {
-						rf.mu.Lock()
-						args := InstallSnapshotArgs{
-							Term:             rf.currentTerm,
-							LeaderId:         rf.me,
-							LastIncludeIndex: rf.log.Base,
-							LastIncludedTerm: rf.log.Logs[0].Term,
-							Data:             rf.snapshot,
-						}
-						rf.mu.Unlock()
-						reply := InstallSnapshotReply{}
-						rf.sendInstallSnapshot(i, &args, &reply)
-					}(i)
-					return
-				}
-
-				rf.mu.Lock()
-				args := &AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					LeaderId:     rf.me,
-					PrevLogIndex: rf.nextIndex[i] - 1,
-					PrevLogTerm:  rf.log.index(rf.nextIndex[i] - 1).Term,
-					Entries:      rf.log.Logs[(rf.nextIndex[i] - rf.log.Base):],
-					LeaderCommit: rf.commitIndex,
-				}
-				reply := &AppendEntriesReply{}
-				rf.mu.Unlock()
-				if rf.sendAppendEntries(i, args, reply) {
-					rf.mu.Lock()
-					if rf.state != Leader {
-						DPrintf("[broadcastHeartbeat] lost leadership: state:%v, term:%v\n", rf.state, rf.currentTerm)
-						rf.mu.Unlock()
-						return
-					}
-					if rf.currentTerm != args.Term {
-						DPrintf("[broadcastHeartbeat] raft %v node term inconsistency: currentTerm:%v, args.Term:%v, state: %v\n", rf.me, rf.currentTerm,
-							args.Term, rf.state)
-						rf.mu.Unlock()
-						return
-					}
-					if reply.Success {
-						DPrintf("[broadcastHeartbeat] success, server %v received %v entries\n", i, rf.me)
-						rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
-						rf.nextIndex[i] = rf.matchIndex[i] + 1
-						rf.checkN()
-					} else {
-						DPrintf("[broadcastHeartbeat] fail, state: %v, term: %v\n", rf.state, rf.currentTerm)
-						if reply.Term > rf.currentTerm {
-							rf.convertTo(Follow)
-							rf.currentTerm = reply.Term
-							rf.persist()
-							rf.mu.Unlock()
-							return
-						}
-
-						rf.nextIndex[i] = reply.ConflictIndex
-						DPrintf("[broadcastHeartbeat] raft %v append entries to %v reject: decrement nextIndex and retry\n", rf.me, i)
-						rf.mu.Unlock()
-						goto retry
-					}
-					rf.mu.Unlock()
-				} else {
-					DPrintf("[broadcastHeartbeat] raft %v call raft %v Raft.AppendEntries failed\n", rf.me, i)
+				for !rf.ReplicationEntries(i) {
 				}
 			}(i)
 		}

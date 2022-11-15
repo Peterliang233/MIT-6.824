@@ -20,24 +20,16 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	reply.Term = rf.currentTerm
 
-	if args.Term < rf.currentTerm {
-		rf.mu.Unlock()
-		DPrintf("[InstallSnapshot] raft %v InstallSnapshot error, args.Term: %v, rf.currentTerm: %v\n", rf.me, args.Term, rf.currentTerm)
-		return
-	}
-
 	if args.Term > rf.currentTerm {
 		rf.convertTo(Follow)
 		rf.currentTerm = args.Term
 		rf.persist()
 	}
 
-	if args.Term == rf.currentTerm {
-		if rf.state == Leader {
-			DPrintf("[InstallSnapshot] raft %v now is leader,cannot accept InstallSnapshot", rf.me)
-		} else if rf.state == Candidate {
-			rf.state = Follow
-		}
+	if args.Term < rf.currentTerm {
+		rf.mu.Unlock()
+		DPrintf("[InstallSnapshot] raft %v InstallSnapshot error, args.Term: %v, rf.currentTerm: %v\n", rf.me, args.Term, rf.currentTerm)
+		return
 	}
 
 	if args.LastIncludeIndex <= rf.log.Base {
@@ -56,9 +48,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	rf.mu.Unlock()
 
-	go func() {
+	go func(msg ApplyMsg) {
 		rf.applyCh <- msg
-	}()
+	}(msg)
 
 }
 
@@ -86,6 +78,7 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 	}
 
 	rf.nextIndex[server] = args.LastIncludeIndex + 1
+	rf.matchIndex[server] = args.LastIncludeIndex
 }
 
 //
